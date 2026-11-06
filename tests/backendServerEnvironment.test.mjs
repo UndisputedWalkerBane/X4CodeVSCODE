@@ -35,7 +35,8 @@ async function loadBackend(file) {
         b.onLoad({ filter: /.*/, namespace: "agent-boundary" }, ({ path }) => ({
           contents: path === "node:child_process"
             ? `export const spawn = (...args) => ${mockAccess}.spawn(...args);`
-            : `export const query = (...args) => ${mockAccess}.query(...args);`,
+            : `export const query = (...args) => ${mockAccess}.query(...args);
+               export const forkSession = () => { throw new Error("unexpected native fork in environment test"); };`,
         }));
       },
     }],

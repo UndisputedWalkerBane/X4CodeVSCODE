@@ -47,6 +47,23 @@ export interface Attachment {
   path: string;
 }
 
+export type UserMessageKind = "prompt" | "steer" | "question";
+
+/** Display metadata only. Native edit anchors remain owned by the host. */
+export interface SentUserMessage {
+  messageId: string;
+  agent: AgentId;
+  kind: UserMessageKind;
+  attachmentFiles: Attachment[];
+  editUnavailableReason?: string;
+}
+
+export interface AttachmentDraftContext {
+  draftId: string;
+  recordId: string;
+  uploadId?: string;
+}
+
 /** Slash-команда CLI для меню автодополнения в композере. */
 export interface SlashCommandInfo {
   name: string;
@@ -95,7 +112,9 @@ export type WebviewToHost =
       path?: string;
       chatId?: string;
     }
-  | { type: "pickAttachment"; path?: string; chatId?: string }
+  | { type: "prepareMessageEdit"; requestId: string; recordId: string; messageId: string; path?: string; chatId?: string }
+  | { type: "editMessage"; requestId: string; recordId: string; messageId: string; text: string; attachments: Attachment[]; path?: string; chatId?: string }
+  | { type: "pickAttachment"; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
   | {
       /** path — проект ленты, в чью папку сохранить (не «активный» хоста). */
       type: "saveAttachment";
@@ -103,6 +122,7 @@ export type WebviewToHost =
       dataBase64: string;
       path?: string;
       chatId?: string;
+      draftContext?: AttachmentDraftContext;
     }
   | { type: "stop"; path?: string; chatId?: string }
   | { type: "newSession"; chatId?: string; requestId?: string }
@@ -180,6 +200,8 @@ export type HostToWebview =
       type: "userMessage";
       text: string;
       attachments?: string[];
+      sentMessage?: SentUserMessage;
+      recordId?: string;
       path?: string;
       chatId?: string;
     }
@@ -196,7 +218,7 @@ export type HostToWebview =
       chatId?: string;
     }
   | { type: "info"; text: string; path?: string; chatId?: string }
-  | { type: "error"; message: string; path?: string; chatId?: string }
+  | { type: "error"; message: string; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
   | { type: "reset"; path?: string; chatId?: string }
   | {
       type: "permissionRequest";
@@ -236,7 +258,9 @@ export type HostToWebview =
       type: "draftHandled";
       path?: string;
     }
-  | { type: "attachmentAdded"; files: Attachment[]; path?: string }
+  | { type: "messageEditPrepared"; requestId: string; sourceRecordId: string; messageId: string; agent?: AgentId; text?: string; attachments?: Attachment[]; missingAttachments?: string[]; error?: string; path?: string; chatId?: string }
+  | { type: "editMessageResult"; requestId: string; ok: boolean; sourceRecordId: string; recordId?: string; error?: string; path?: string; chatId?: string }
+  | { type: "attachmentAdded"; files: Attachment[]; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
   | { type: "serverTestResult"; projectPath: string; requestId: string; ok: boolean; message: string }
   | { type: "configJson"; json: string; chatId?: string }
   | { type: "configJsonResult"; ok: boolean; message: string }

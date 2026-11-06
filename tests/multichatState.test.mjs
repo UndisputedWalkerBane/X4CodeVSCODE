@@ -235,7 +235,7 @@ test("project picker changes only the requesting tile and leaves legacy selectio
   assert.equal(h.p.getActiveProject().id, h.projects[0].id);
 });
 
-function backendFixture(h, finished) {
+function backendFixture(h, ...finished) {
   h.projects.forEach((project) => { project.path = temp; });
   h.p.context.secrets = { get: async () => undefined };
   h.p.directoryRuns = new Map(); h.p.sessionWriters = new Map();
@@ -245,14 +245,109 @@ function backendFixture(h, finished) {
   h.p.buildAgentConfig = () => ({ contextWindow: 0 });
   h.starts = [];
   h.p.backends = { claude: { async *start(prompt, options) {
+    const completion = finished[h.starts.length];
     h.starts.push({ prompt, options });
-    await finished.promise;
+    await completion.promise;
     yield { kind: "result", ok: false };
   } } };
 }
 async function until(predicate) {
   for (let attempt = 0; attempt < 50; attempt++) { if (predicate()) return; await tick(); }
   assert.fail("expected backend state was not reached");
+}
+
+async function captureStopFallback(dispatch) {
+  const scheduled = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  let stopped;
+  try {
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      assert.equal(delay, 6000, "only the Stop fallback is intercepted");
+      scheduled.push(() => callback(...args));
+      return 0;
+    };
+    stopped = dispatch();
+  } finally { globalThis.setTimeout = originalSetTimeout; }
+  await stopped;
+  assert.equal(scheduled.length, 1, "Stop schedules one fallback for its running turn");
+  return scheduled[0];
+}
+
+for (const surface of ["multi-panel", "view"]) {
+  test(`a completed turn's Stop fallback cannot clear its replacement on ${surface}`, { timeout: 5000 }, async () => {
+    const h = setup(); const selected = h.slots[0]; const firstFinished = gate(); const replacementFinished = gate();
+    backendFixture(h, firstFinished, replacementFinished);
+    h.p.getProjectStore(selected.projectPath).activeId = selected.recordId;
+    const route = { path: selected.projectPath, ...(surface === "multi-panel" ? { chatId: selected.chatId } : {}) };
+    const dispatch = (message) => h.p.onMessage({ ...message, ...route }, "vscode", undefined, surface);
+    const send = (text) => dispatch({ type: "send", text, agent: "claude" });
+    const first = send("first turn"); let replacement;
+    try {
+      await until(() => h.starts.length === 1);
+      const fallback = await captureStopFallback(() => dispatch({ type: "stop" }));
+      assert.equal(h.starts[0].options.signal.aborted, true, "Stop interrupts the selected turn");
+      firstFinished.resolve(); await first;
+      replacement = send("replacement turn");
+      await until(() => h.starts.length === 2);
+      const messageIndex = h.messages.length;
+      fallback();
+      await send("attempt while replacement runs");
+      assert.deepEqual(h.messages.slice(messageIndex).filter((message) => message.type === "error").map((message) => message.message), [
+        "В этом чате уже идёт ход. Дождитесь ответа или остановите его.",
+      ], "the replacement stays registered instead of reporting a false cross-chat CLI conflict");
+      assert.equal(h.messages.slice(messageIndex).some((message) => message.type === "busy" && !message.value), false,
+        "an older Stop timer must not tell the UI that the replacement has finished");
+      assert.equal(h.starts.length, 2, "the next send cannot start over a running replacement");
+      assert.equal(h.starts[1].options.signal.aborted, false);
+    } finally { firstFinished.resolve(); replacementFinished.resolve(); await first; await replacement; }
+  });
+
+  test(`Stop still clears busy when its original backend ignores interruption on ${surface}`, { timeout: 5000 }, async () => {
+    const h = setup(); const selected = h.slots[0]; const finished = gate();
+    backendFixture(h, finished);
+    h.p.getProjectStore(selected.projectPath).activeId = selected.recordId;
+    const route = { path: selected.projectPath, ...(surface === "multi-panel" ? { chatId: selected.chatId } : {}) };
+    const dispatch = (message) => h.p.onMessage({ ...message, ...route }, "vscode", undefined, surface);
+    const turn = dispatch({ type: "send", text: "unresponsive turn", agent: "claude" });
+    try {
+      await until(() => h.starts.length === 1);
+      const fallback = await captureStopFallback(() => dispatch({ type: "stop" }));
+      const messageIndex = h.messages.length;
+      fallback();
+      assert.equal(h.starts[0].options.signal.aborted, true);
+      assert.deepEqual(h.messages.slice(messageIndex).map((message) => ({ type: message.type, value: message.value, message: message.message })), [
+        { type: "busy", value: false, message: undefined },
+        { type: "error", value: undefined, message: "Ход остановлен принудительно: бэкенд не ответил на прерывание." },
+      ]);
+    } finally { finished.resolve(); await turn; }
+  });
+}
+
+for (const shared of ["record", "CLI session"]) {
+  test(`a second chat sharing a ${shared} is rejected until the owning turn completes`, { timeout: 5000 }, async () => {
+    const h = setup(); const owner = h.slots[0]; const contender = h.slots[1]; const ownerFinished = gate(); const contenderFinished = gate();
+    backendFixture(h, ownerFinished, contenderFinished);
+    if (shared === "record") contender.recordId = owner.recordId;
+    else h.records[0].agentIds.claude = h.records[1].agentIds.claude = "shared-cli-session";
+    const send = (slot, text) => h.send({ type: "send", chatId: slot.chatId, path: slot.projectPath, text, agent: "claude" });
+    const ownerTurn = send(owner, "owning turn"); let contenderTurn;
+    try {
+      await until(() => h.starts.length === 1);
+      await send(contender, "conflicting turn");
+      assert.equal(h.starts.length, 1, "a conflicting chat cannot reach the backend");
+      assert.deepEqual(h.messages.filter((message) => message.type === "error").map((message) => ({ chatId: message.chatId, message: message.message })), [
+        { chatId: contender.chatId, message: "Эта CLI-сессия уже запущена в другом чате. Выберите отдельную сессию." },
+      ]);
+      assert.equal(h.starts[0].options.signal.aborted, false, "rejecting another chat leaves its owner running");
+      ownerFinished.resolve(); await ownerTurn;
+      const messageIndex = h.messages.length;
+      contenderTurn = send(contender, "after owner completes");
+      await until(() => h.starts.length === 2);
+      assert.equal(h.starts[1].options.resumeSessionId, shared === "CLI session" ? "shared-cli-session" : undefined);
+      assert.equal(h.messages.slice(messageIndex).some((message) => message.type === "error"), false,
+        "the shared session is available after the owning turn releases it");
+    } finally { ownerFinished.resolve(); contenderFinished.resolve(); await ownerTurn; await contenderTurn; }
+  });
 }
 
 test("run admission waits for a pending new session without blocking other tiles for the running turn", { timeout: 5000 }, async () => {

@@ -151,7 +151,7 @@ test("history, model overrides and transcripts are scoped by profile", async () 
   assert.notEqual(first.id, second.id);
   await p.setActivePath(a.id);
   await p.applyModel("codex", "model-a", false);
-  await p.onMessage({ type: "saveTranscript", path: b.id, items: [{ role: "user", text: "B only" }] });
+  await p.onMessage({ type: "saveTranscript", path: b.id, recordId: second.id, items: [{ role: "user", text: "B only" }] });
   assert.equal(first.modelOverrides.codex, "model-a");
   assert.equal(second.modelOverrides?.codex, undefined);
   assert.deepEqual(first.items, []);

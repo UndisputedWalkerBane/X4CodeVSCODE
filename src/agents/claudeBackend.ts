@@ -1,5 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentBackend, AgentEvent, StartOptions } from "./types";
+import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
+
+import { prepareClaudeEdit, verifiedClaudePath } from "./claudeNativeHistory";
 
 /** Окно контекста по имени модели: haiku и старые 3.x — 200k, актуальные — 1M. */
 function inferClaudeWindow(model: string): number {
@@ -38,12 +40,13 @@ class InputQueue<T> implements AsyncIterable<T> {
 }
 
 /** Сообщение пользователя в формате потокового ввода SDK. */
-function userMessage(text: string, priority?: "now" | "next" | "later") {
+function userMessage(text: string, priority?: "now" | "next" | "later", uuid?: string) {
   return {
     type: "user" as const,
     message: { role: "user" as const, content: text },
     parent_tool_use_id: null,
     ...(priority ? { priority } : {}),
+    ...(uuid ? { uuid } : {}),
   };
 }
 
@@ -55,6 +58,10 @@ function userMessage(text: string, priority?: "now" | "next" | "later") {
  */
 export class ClaudeBackend implements AgentBackend {
   readonly id = "claude";
+
+  prepareEdit(opts: PrepareEditOptions): Promise<PreparedEdit> {
+    return prepareClaudeEdit(opts);
+  }
 
   async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
     const abortController = new AbortController();
@@ -109,7 +116,23 @@ export class ClaudeBackend implements AgentBackend {
 
     // Смена модели — ТОЛЬКО по явному сигналу CLI, без сравнения названий:
     // хук PostModelSwitch сообщает from/to и причину (auto = автофоллбэк).
+    let anchorCaptured = false;
     options.hooks = {
+      UserPromptSubmit: [{ hooks: [async (input: unknown) => {
+        const i = input as { prompt?: string; session_id?: string; transcript_path?: string; cwd?: string; source?: string };
+        if (!anchorCaptured && opts.messageId && i.prompt === prompt && i.session_id && i.transcript_path && (!i.source || i.source === "sdk")) {
+          try {
+            const transcriptPath = await verifiedClaudePath(opts, i.session_id, i.transcript_path);
+            anchorCaptured = true;
+            pendingEvents.push({ kind: "nativePrompt", messageId: opts.messageId, anchor: {
+              provider: "claude", sessionId: i.session_id, userMessageUuid: opts.messageId, transcriptPath,
+            } });
+          } catch {
+            // A nonlocal/custom store has no safe local rewind anchor. Normal inference continues.
+          }
+        }
+        return {};
+      }] }],
       PostModelSwitch: [
         {
           hooks: [
@@ -141,7 +164,7 @@ export class ClaudeBackend implements AgentBackend {
     // Потоковый ввод: первое сообщение — промпт; пока ход идёт, хост может
     // докинуть сообщения (корректировка на лету) с приоритетом now/next.
     const input = new InputQueue<ReturnType<typeof userMessage>>();
-    input.push(userMessage(prompt));
+    input.push(userMessage(prompt, undefined, opts.messageId));
     let lastSteerAt = 0;
     let initCount = 0;
     let closeTimer: ReturnType<typeof setTimeout> | undefined;

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
-import type { AgentBackend, AgentEvent, StartOptions } from "./types";
+import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
 import {
   CodexBackend,
   WRITER_CONFLICT_RE,
@@ -12,8 +12,22 @@ import {
   trackCodexProcess,
 } from "./codexBackend";
 
+import { prepareCodexEdit } from "./nativeHistory";
+
 type Json = Record<string, unknown>;
 type End = { kind: "__end" };
+const STARTUP_REQUEST_TIMEOUT_MS = 60_000;
+const STARTUP_METHODS = new Set(["initialize", "thread/start", "thread/resume", "thread/fork", "turn/start"]);
+
+class StartupRequestTimeoutError extends Error {
+  constructor(method: string) {
+    super(
+      `${method} не ответил за ${STARTUP_REQUEST_TIMEOUT_MS / 1000} с. Запуск остановлен; сохранённая история не удалена. ` +
+      (method === "turn/start" ? "Ход мог быть принят сервером, поэтому запрос автоматически не повторяется. " : "") +
+      "Проверьте состояние Codex и повторите запуск вручную.",
+    );
+  }
+}
 
 /**
  * Бэкенд Codex через `codex app-server` — JSON-RPC по stdio, тот же протокол,
@@ -33,6 +47,10 @@ type End = { kind: "__end" };
 export class CodexAppServerBackend implements AgentBackend {
   readonly id = "codex";
   private readonly exec = new CodexBackend();
+
+  prepareEdit(opts: PrepareEditOptions): Promise<PreparedEdit> {
+    return prepareCodexEdit(opts);
+  }
 
   async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
@@ -80,10 +98,34 @@ export class CodexAppServerBackend implements AgentBackend {
     };
     const request = (method: string, params: Json) =>
       new Promise<Json>((resolve, reject) => {
+        if (opts.signal.aborted) {
+          reject(new Error("ход отменён"));
+          return;
+        }
         const id = ++nextId;
-        pending.set(id, { resolve, reject });
-        write({ id, method, params });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const settle = () => {
+          if (!pending.delete(id)) return false;
+          if (timer) clearTimeout(timer);
+          return true;
+        };
+        pending.set(id, {
+          resolve: (value) => { if (settle()) resolve(value); },
+          reject: (error) => { if (settle()) reject(error); },
+        });
+        if (STARTUP_METHODS.has(method)) {
+          timer = setTimeout(() => pending.get(id)?.reject(new StartupRequestTimeoutError(method)), STARTUP_REQUEST_TIMEOUT_MS);
+          timer.unref();
+        }
+        try {
+          write({ id, method, params });
+        } catch (err) {
+          pending.get(id)?.reject(err instanceof Error ? err : new Error(String(err)));
+        }
       });
+    const rejectPending = (error: Error) => {
+      for (const pr of pending.values()) pr.reject(error);
+    };
 
     let threadId: string | null = opts.resumeSessionId ?? null;
     let turnId: string | null = null;
@@ -129,6 +171,9 @@ export class CodexAppServerBackend implements AgentBackend {
         const id = (r.turn as Json | undefined)?.id;
         if (typeof id !== "string" || !id) throw new Error("turn/start не вернул ID хода");
         turnId = id;
+        if (withImages && opts.messageId && threadId) {
+          emit({ kind: "nativePrompt", messageId: opts.messageId, anchor: { provider: "codex", sessionId: threadId, turnId: id } });
+        }
         turnStartPending = null;
         const notifications = earlyNotifications;
         earlyNotifications = [];
@@ -327,7 +372,6 @@ export class CodexAppServerBackend implements AgentBackend {
       const id = m.id as number | undefined;
       if (id !== undefined && (m.result !== undefined || m.error !== undefined) && pending.has(id)) {
         const pr = pending.get(id);
-        pending.delete(id);
         if (m.error) {
           pr?.reject(new Error(String((m.error as { message?: string }).message ?? JSON.stringify(m.error))));
         } else {
@@ -351,13 +395,11 @@ export class CodexAppServerBackend implements AgentBackend {
     let spawnError: Error | null = null;
     child.on("error", (err) => {
       spawnError = err;
-      for (const pr of pending.values()) pr.reject(err);
-      pending.clear();
+      rejectPending(err);
       finish();
     });
     child.on("exit", (code) => {
-      for (const pr of pending.values()) pr.reject(new Error(`codex app-server завершился (код ${code})`));
-      pending.clear();
+      rejectPending(new Error(`codex app-server завершился (код ${code})`));
       if (!finished && !opts.signal.aborted) {
         const stderr = stderrChunks.join("").trim();
         emit({
@@ -371,10 +413,13 @@ export class CodexAppServerBackend implements AgentBackend {
       finish();
     });
 
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
     const onAbort = () => {
       // Мягко прерываем ход (тред допишется), затем добиваем процесс.
       if (threadId && turnId) write({ id: ++nextId, method: "turn/interrupt", params: { threadId, turnId } });
-      setTimeout(() => hardKill(child), 1500).unref();
+      rejectPending(new Error("ход отменён"));
+      abortTimer = setTimeout(() => hardKill(child), 1500);
+      abortTimer.unref();
     };
     opts.signal.addEventListener("abort", onAbort, { once: true });
 
@@ -397,7 +442,7 @@ export class CodexAppServerBackend implements AgentBackend {
         let th: Json;
         if (opts.resumeSessionId) {
           try {
-            th = await request("thread/resume", { threadId: opts.resumeSessionId, ...common });
+            th = await request("thread/resume", { threadId: opts.resumeSessionId, ...common, excludeTurns: true });
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             if (opts.signal.aborted || !WRITER_CONFLICT_RE.test(message)) throw err;
@@ -428,7 +473,7 @@ export class CodexAppServerBackend implements AgentBackend {
         threadReady = true;
         if (threadId) {
           trackCodex(threadId, child);
-          yield { kind: "session", sessionId: threadId };
+          yield { kind: "session", sessionId: threadId, ...(forkRecovery ? { forkedFromSessionId: opts.resumeSessionId } : {}) };
         }
         const model = (th.model as string | undefined) || cfg.model || codexDefaultModel();
         if (model) yield { kind: "model", model };
@@ -462,7 +507,7 @@ export class CodexAppServerBackend implements AgentBackend {
           yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
           return;
         }
-        if (!threadReady && !spawnError) {
+        if (!threadReady && !spawnError && !(err instanceof StartupRequestTimeoutError)) {
           // app-server не поднялся/не понял протокол (старый CLI) — работаем через exec.
           yield {
             kind: "notice",
@@ -506,6 +551,8 @@ export class CodexAppServerBackend implements AgentBackend {
       }
     } finally {
       opts.signal.removeEventListener("abort", onAbort);
+      if (abortTimer) clearTimeout(abortTimer);
+      rejectPending(new Error("Codex: соединение закрыто"));
       if (opts.steer) opts.steer.handler = undefined;
       rl.close();
       // Не отпускаем ход, пока собственный app-server ещё удерживает writer.

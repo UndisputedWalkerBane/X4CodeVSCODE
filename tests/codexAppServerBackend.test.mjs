@@ -81,7 +81,29 @@ async function until(condition) {
   assert.fail("mock app-server did not reach the expected state");
 }
 
-async function launch(t, { resume = false, start = true, waitFor = "turn", onThread, onEvent, config = {}, attachments, staleCleanup = true } = {}) {
+function fakeClock(t) {
+  let now = 0;
+  const timers = new Map();
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const timer = { unref() { return this; } };
+    timers.set(timer, { callback, at: now + delay });
+    return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer) => timers.delete(timer));
+  return {
+    get pending() { return timers.size; },
+    advance(ms) {
+      now += ms;
+      for (const [timer, entry] of [...timers]) {
+        if (entry.at > now) continue;
+        timers.delete(timer);
+        entry.callback();
+      }
+    },
+  };
+}
+
+async function launch(t, { resume = false, start = true, waitFor = "turn", onInitialize, onThread, onEvent, config = {}, attachments, staleCleanup = true, messageId } = {}) {
   const h = {
     child: new EventEmitter(), writes: [], events: [], confirms: [], execCalls: [], processTracking: [], kills: 0, staleCleanup,
     done: false, thread: resume ? "resumed-main" : "main", turn: "main-turn", steer: {}, abort: new AbortController(),
@@ -98,7 +120,10 @@ async function launch(t, { resume = false, start = true, waitFor = "turn", onThr
     write(chunk, encoding, callback) {
       const m = JSON.parse(chunk.toString());
       h.writes.push(m);
-      if (m.method === "initialize") h.reply(m, {});
+      if (m.method === "initialize") {
+        if (onInitialize) onInitialize(m, h);
+        else h.reply(m, {});
+      }
       if (["thread/start", "thread/resume", "thread/fork"].includes(m.method)) {
         if (onThread) onThread(m, h);
         else h.reply(m, { thread: { id: h.thread }, model: "test-model" });
@@ -115,7 +140,7 @@ async function launch(t, { resume = false, start = true, waitFor = "turn", onThr
     h.reply(request, { turn: { id, status: "inProgress", items: [] } });
   h.run = (async () => {
     for await (const event of new CodexAppServerBackend().start("work", {
-      cwd: temp, config: { contextWindow: 0, ...config }, signal: h.abort.signal, attachments,
+      cwd: temp, config: { contextWindow: 0, ...config }, signal: h.abort.signal, attachments, messageId,
       steer: h.steer, ...(resume ? { resumeSessionId: h.thread } : {}),
       confirmTool: (...args) => {
         h.confirms.push(args);
@@ -138,7 +163,8 @@ async function launch(t, { resume = false, start = true, waitFor = "turn", onThr
   });
   await until(() => waitFor === "done" ? h.done : waitFor === "thread"
     ? h.writes.some((m) => m.method === "thread/start" || m.method === "thread/resume")
-    : h.turnRequests().length === 1 || h.done);
+    : waitFor === "turn" ? h.turnRequests().length === 1 || h.done
+      : h.writes.some((m) => m.method === waitFor) || h.done);
   if (start) {
     assert.equal(h.turnRequests().length, 1, "backend must start the requested task");
     h.acceptStart();
@@ -147,6 +173,100 @@ async function launch(t, { resume = false, start = true, waitFor = "turn", onThr
     await tick();
   }
   return h;
+}
+
+test("resuming long history omits stored turns from the startup response", async (t) => {
+  const h = await launch(t, { resume: true });
+  assert.equal(h.writes.find((m) => m.method === "thread/resume").params.excludeTurns, true);
+  assert.deepEqual(h.events.filter((event) => event.kind === "session"), [{ kind: "session", sessionId: "resumed-main" }]);
+});
+
+for (const stage of ["initialize", "thread/start", "thread/resume", "thread/fork", "turn/start"]) {
+  test(`an unanswered ${stage} startup request fails within 60 seconds without replay`, async (t) => {
+    const clock = fakeClock(t);
+    const h = await launch(t, {
+      resume: stage === "thread/resume" || stage === "thread/fork",
+      start: false, waitFor: stage,
+      onInitialize(request, h) { if (stage !== "initialize") h.reply(request, {}); },
+      onThread(request, h) {
+        if (request.method === stage) return;
+        if (stage === "thread/fork" && request.method === "thread/resume") conflictReply(h, request);
+        else h.reply(request, { thread: { id: h.thread } });
+      },
+    });
+    assert.equal(clock.pending, 1, "only the unanswered startup request should retain a deadline");
+    clock.advance(59_999);
+    await tick();
+    assert.equal(h.done, false);
+    clock.advance(1);
+    await until(() => h.done);
+    assert.equal(h.events.filter((e) => e.kind === "result").length, 1);
+    assert.equal(h.events.at(-1).ok, false);
+    assert.match(h.events.find((e) => e.kind === "error").message, new RegExp(stage));
+    assert.match(h.events.find((e) => e.kind === "error").message, /60|тайм|врем/iu);
+    assert.equal(h.execCalls.length, 0, "a timeout must not automatically replay the prompt");
+    assert.equal(h.turnRequests().length, stage === "turn/start" ? 1 : 0);
+    assert.equal(h.kills, 1);
+    assert.equal(clock.pending, 0, "timeout and cleanup must clear every deadline");
+    // A late reply cannot revive the stopped request or start the task again.
+    h.reply(h.writes.find((m) => m.method === stage), { thread: { id: "late" }, turn: { id: "late" } });
+    await tick();
+    assert.equal(h.turnRequests().length, stage === "turn/start" ? 1 : 0);
+  });
+}
+
+test("completed startup clears deadlines while model, tools, approvals and steering can wait", async (t) => {
+  const clock = fakeClock(t);
+  const h = await launch(t);
+  assert.equal(clock.pending, 0);
+  let resolveConfirmation;
+  h.confirm = () => new Promise((resolve) => { resolveConfirmation = resolve; });
+  h.send({ id: 100, method: "item/commandExecution/requestApproval", params: { ...h.scope(), command: "long task" } });
+  await until(() => resolveConfirmation);
+  h.notify("item/started", { ...h.scope(), item: { id: "tool", type: "commandExecution", command: "long task" } });
+  // Withhold the steering response; the running turn has no startup deadline.
+  const write = h.child.stdin._write;
+  h.child.stdin._write = (chunk, encoding, callback) => {
+    const request = JSON.parse(chunk.toString());
+    if (request.method === "turn/steer") { h.writes.push(request); callback(); }
+    else write(chunk, encoding, callback);
+  };
+  const steering = h.steer.handler("more context", "next");
+  clock.advance(10 * 60_000);
+  await tick();
+  assert.equal(h.done, false);
+  assert.equal(h.kills, 0);
+  assert.equal(clock.pending, 0);
+  resolveConfirmation({ allow: true });
+  h.reply(h.writes.find((m) => m.method === "turn/steer"), {});
+  await steering;
+  h.complete();
+  await h.run;
+  assert.equal(h.events.at(-1).ok, true);
+  assert.equal(clock.pending, 0);
+});
+
+test("abort during an unanswered startup request settles immediately and clears cleanup timers", async (t) => {
+  const clock = fakeClock(t);
+  const h = await launch(t, { start: false, waitFor: "initialize", onInitialize() {} });
+  h.abort.abort();
+  await until(() => h.done);
+  assert.equal(h.turnRequests().length, 0);
+  assert.equal(h.execCalls.length, 0);
+  assert.equal(h.kills, 1);
+  assert.equal(clock.pending, 0);
+});
+
+for (const event of ["error", "exit"]) {
+  test(`process ${event} clears unanswered startup deadlines`, async (t) => {
+    const clock = fakeClock(t);
+    const h = await launch(t, { start: false, waitFor: "initialize", onInitialize() {} });
+    if (event === "error") h.child.emit("error", new Error("spawn failed"));
+    else { h.child.exitCode = 1; h.child.emit("exit", 1); }
+    await h.run;
+    assert.equal(clock.pending, 0);
+    assert.equal(h.turnRequests().length, 0);
+  });
 }
 
 test("child completion leaves the generator and process alive until the main final answer", async (t) => {
@@ -442,7 +562,7 @@ test("resume writer conflict forks stored history and starts the prompt once in 
   assert.deepEqual(forks[0].params, {
     threadId: "resumed-main", cwd: temp, model: "gpt-6-astra", sandbox: "read-only", approvalPolicy: "never", excludeTurns: true,
   });
-  assert.deepEqual(h.events.filter((e) => e.kind === "session"), [{ kind: "session", sessionId: "forked-main" }]);
+  assert.deepEqual(h.events.filter((e) => e.kind === "session"), [{ kind: "session", sessionId: "forked-main", forkedFromSessionId: "resumed-main" }]);
   const notice = h.events.findIndex((e) => e.kind === "notice" && /отдельн.*тред|отдельн.*ветк/iu.test(e.text));
   assert.ok(notice >= 0, "recovery must explain that continuation uses a separate thread");
   assert.match(h.events[notice].text, /истори/iu);
@@ -600,4 +720,12 @@ test("the owned app-server is tracked before its thread handshake completes", as
   await until(() => h.steer.handler);
   h.complete();
   await h.run;
+});
+
+test("ordinary Codex prompt captures only authoritative turn/start response ID", async (t) => {
+ const h=await launch(t,{start:false,messageId:"host-user-uuid"});
+ h.notify("turn/started",{threadId:h.thread,turn:{id:"unrelated",status:"inProgress",items:[]}});
+ h.acceptStart(undefined,"authoritative");await until(()=>h.events.some(e=>e.kind==="nativePrompt"));
+ assert.deepEqual(h.events.find(e=>e.kind==="nativePrompt"),{kind:"nativePrompt",messageId:"host-user-uuid",anchor:{provider:"codex",sessionId:h.thread,turnId:"authoritative"}});
+ h.complete("authoritative");await h.run;
 });

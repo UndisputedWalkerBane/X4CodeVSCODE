@@ -4,9 +4,33 @@
  * CodexBackend  — появится на шаге 4 дорожной карты.
  */
 
+/** Provider IDs are host-owned metadata, never supplied by the webview. */
+export type NativePromptAnchor =
+  | { provider: "codex"; sessionId: string; turnId: string }
+  | { provider: "claude"; sessionId: string; userMessageUuid: string; transcriptPath: string };
+
+export interface PrepareEditOptions {
+  cwd: string;
+  sessionId: string;
+  anchor?: NativePromptAnchor;
+  legacyPrompt?: string;
+  signal: AbortSignal;
+  config: AgentRunConfig;
+  extraEnv?: Record<string, string>;
+  cliPath?: string;
+}
+
+export interface PreparedEdit {
+  /** Undefined means an empty prefix: start a fresh native session. */
+  resumeSessionId?: string;
+  /** Retained OLD provider turn/message IDs -> anchors in the fork. */
+  remappedAnchors?: Record<string, NativePromptAnchor>;
+}
+
 /** Нормализованные события, которые бэкенд отдаёт наружу независимо от модели. */
 export type AgentEvent =
-  | { kind: "session"; sessionId: string }
+  | { kind: "nativePrompt"; messageId: string; anchor: NativePromptAnchor }
+  | { kind: "session"; sessionId: string; forkedFromSessionId?: string }
   | { kind: "activity"; label: string }
   | { kind: "textDelta"; text: string }
   | { kind: "assistantText"; text: string }
@@ -78,6 +102,8 @@ export interface SteerChannel {
 }
 
 export interface StartOptions {
+  /** Stable host user-message ID (UUID for Claude streamed input). */
+  messageId?: string;
   /** Рабочая папка проекта, в которой действует агент. */
   cwd: string;
   /** id прошлой сессии для возобновления диалога. */
@@ -110,4 +136,5 @@ export interface StartOptions {
 export interface AgentBackend {
   readonly id: string;
   start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent>;
+  prepareEdit?(opts: PrepareEditOptions): Promise<PreparedEdit>;
 }

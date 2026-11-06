@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -7,12 +7,15 @@ import * as vscode from "vscode";
 import type {
   AgentId,
   Attachment,
+  AttachmentDraftContext,
   HostToWebview,
   ProjectInfo,
+  SentUserMessage,
+  UserMessageKind,
   SlashCommandInfo,
   WebviewToHost,
 } from "./shared/protocol";
-import type { AgentBackend, SteerChannel } from "./agents/types";
+import type { AgentBackend, NativePromptAnchor, SteerChannel } from "./agents/types";
 import { ClaudeBackend } from "./agents/claudeBackend";
 import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBackend";
 import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
@@ -136,6 +139,24 @@ interface ChatLogEntry {
   text: string;
 }
 
+/** Authoritative prompt identity. Renderer snapshots never supply these fields. */
+interface StoredSentMessage extends SentUserMessage {
+  text: string;
+  logCut?: number;
+  /** Common-log position already present in native history before this prompt. */
+  seenBefore?: number;
+  anchor?: NativePromptAnchor;
+  providerInput?: string;
+  missingAttachmentNames?: string[];
+}
+
+interface MessageEditPreparation {
+  controller: AbortController;
+  projectPath: string;
+  directory: string;
+  recordId: string;
+}
+
 /** Одна сессия в истории проекта. */
 interface SessionRecord {
   id: string;
@@ -146,6 +167,7 @@ interface SessionRecord {
   agentIds: ProjectSessions;
   /** Сохранённая лента чата (элементы webview). */
   items: unknown[];
+  sentMessages?: Record<string, StoredSentMessage>;
   /** Общий лог беседы: лента одна, а CLI-сессии агентов раздельные. */
   chatLog?: ChatLogEntry[];
   /** До какого индекса chatLog каждый агент видел ленту в своей CLI-сессии. */
@@ -225,7 +247,7 @@ function clipLog(text: string): string {
  * а CLI-сессии Claude и Codex раздельные — при переключении агенту передаём
  * текстом сообщения, которые обрабатывал другой агент.
  */
-function buildCrossContext(entries: ChatLogEntry[]): { block: string; count: number } | null {
+function buildCrossContext(entries: ChatLogEntry[], fullHistory = false): { block: string; count: number } | null {
   if (entries.length === 0) return null;
   const picked: string[] = [];
   let total = 0;
@@ -234,11 +256,11 @@ function buildCrossContext(entries: ChatLogEntry[]): { block: string; count: num
     const name = e.agent === "claude" ? "Claude" : "Codex";
     const who = e.role === "user" ? `Пользователь (агенту ${name})` : `Агент ${name}`;
     const text =
-      e.text.length > CROSS_INJECT_ENTRY_MAX
+      !fullHistory && e.text.length > CROSS_INJECT_ENTRY_MAX
         ? e.text.slice(0, CROSS_INJECT_ENTRY_MAX) + "\n…[обрезано]"
         : e.text;
     const piece = `${who}:\n${text}`;
-    if (picked.length > 0 && total + piece.length > CROSS_INJECT_TOTAL_MAX) break;
+    if (!fullHistory && picked.length > 0 && total + piece.length > CROSS_INJECT_TOTAL_MAX) break;
     picked.unshift(piece);
     total += piece.length;
   }
@@ -248,7 +270,8 @@ function buildCrossContext(entries: ChatLogEntry[]): { block: string; count: num
       : "";
   const block =
     `Контекст беседы: этот чат общий для двух агентов — Claude и Codex. ` +
-    `Ниже — сообщения этой же беседы, которые обрабатывал другой агент; ты их ещё не видел${note}:\n\n` +
+    (fullHistory ? `Ниже — вся сохранённая история этой беседы до текущего сообщения:\n\n` :
+      `Ниже — сообщения этой же беседы, которые обрабатывал другой агент; ты их ещё не видел${note}:\n\n`) +
     picked.join("\n\n---\n\n") +
     `\n\nЭто часть текущей беседы с пользователем: учитывай её и продолжай с места, где беседа остановилась.`;
   return { block, count: picked.length };
@@ -324,6 +347,7 @@ interface DeferredTurn {
   agent: AgentId;
   chatId?: string;
   questionOrigin?: QuestionOrigin;
+  messageKind?: UserMessageKind;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -365,6 +389,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Shared cwd runs are permitted; overlap disables unsafe pull/auto-Git. */
   private directoryRuns = new Map<string, DirectoryRunGroup>();
   private sessionWriters = new Map<string, AbortController>();
+  private messageEditPreparations = new Map<string, MessageEditPreparation>();
+  private messageEditRequests = new Set<string>();
   /** Long copies run outside the mutation queue, but their directories cannot be moved. */
   private folderCopyReservations = new Set<string>();
   /** Сообщения для транспорта без живого канала; вопросы привязаны к сессии. */
@@ -940,6 +966,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     for (const directory of this.folderCopyReservations ?? []) {
       if (overlaps(directory)) throw new Error("Папка сейчас копируется. Дождитесь завершения копирования перед перемещением.");
+    }
+    for (const preparation of this.messageEditPreparations?.values() ?? []) {
+      if (overlaps(preparation.directory)) throw new Error("В этой папке подготавливается редактирование сообщения. Дождитесь завершения или нажмите Стоп.");
     }
     const keys = new Set(group.map(projectKey));
     for (const entry of this.getAllProjects()) {
@@ -2334,7 +2363,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.postScoped(slot.projectPath, { type: "projects", projects, archivedProjects, activePath: slot.projectPath }, slot.chatId);
       this.postScoped(slot.projectPath, { type: "agentInfo", agent: slot.agent, recordId: slot.recordId }, slot.chatId);
       this.postRecordEfforts(slot.projectPath, record, slot.chatId);
-      this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: record.items, recordId: record.id }, slot.chatId);
+      this.postScoped(slot.projectPath, { type: "transcript", path: slot.projectPath, items: this.canonicalMessageRecord(record, slot.projectPath).items, recordId: record.id }, slot.chatId);
       this.postTaskState(slot.projectPath, record, slot.chatId);
       this.postScoped(slot.projectPath, { type: "busy", value: this.runs.has(slot.chatId) }, slot.chatId);
       for (const agent of ["claude", "codex"] as const) {
@@ -2819,6 +2848,301 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private displaySentMessage(message: StoredSentMessage): SentUserMessage {
+    return { messageId: message.messageId, agent: message.agent, kind: message.kind,
+      attachmentFiles: message.attachmentFiles.map(file => ({ name: file.name, path: file.path })),
+      ...(message.editUnavailableReason ? { editUnavailableReason: message.editUnavailableReason } : {}) };
+  }
+
+  private async recordSentMessage(projectPath: string, recordId: string, createdAt: number, text: string, agent: AgentId,
+    kind: UserMessageKind, attachments: Attachment[], messageId = randomUUID(), isCurrent?: () => boolean): Promise<SentUserMessage | undefined> {
+    let saved: SentUserMessage | undefined;
+    await this.mutateRecord(projectPath, recordId, record => {
+      if (record.createdAt !== createdAt || (isCurrent && !isCurrent())) return;
+      const metadata: StoredSentMessage = { messageId, agent, kind, text, attachmentFiles: attachments,
+        ...(kind === "prompt" ? { logCut: record.chatLog?.length ?? 0 } :
+          { editUnavailableReason: kind === "steer" ? "Корректировку текущего хода нельзя редактировать как исходный запрос." : "Ответ на вопрос агента нельзя редактировать как исходный запрос." }) };
+      const canonical = this.canonicalMessageRecord(record, projectPath);
+      record.sentMessages = { ...canonical.sentMessages, [messageId]: metadata };
+      saved = this.displaySentMessage(metadata);
+      record.items = [...canonical.items, { id: Date.now(), role: "user", text, ts: Date.now(),
+        ...(attachments.length ? { attachments: attachments.map(file => file.name) } : {}), sentMessage: saved }].slice(-TRANSCRIPT_MAX_ITEMS);
+    });
+    return saved;
+  }
+
+  /** Legacy identity is stable across hydration; only a unique retained user log entry supplies a cut. */
+  private canonicalMessageRecord(record: SessionRecord, projectPath: string): SessionRecord {
+    const messages = { ...record.sentMessages };
+    const project = this.getAllProjects().find(entry => projectKey(entry) === projectPath);
+    const attachmentRoot = project ? nodePath.join(project.archive?.path ?? project.path, ".agent-hub", "attachments") : undefined;
+    const items = (record.items ?? []).map((value, index) => {
+      if (!value || typeof value !== "object") return value;
+      const item = value as Record<string, unknown>;
+      if (item.role !== "user" || typeof item.text !== "string") return value;
+      const incoming = item.sentMessage as Partial<SentUserMessage> | undefined;
+      let message = typeof incoming?.messageId === "string" ? messages[incoming.messageId] : undefined;
+      if (!message) {
+        const identity = typeof item.id === "number" || typeof item.id === "string" ? item.id : index;
+        const messageId = `legacy-${createHash("sha256").update(JSON.stringify([record.id, identity, item.text])).digest("hex").slice(0, 32)}`;
+        message = messages[messageId];
+        if (!message) {
+          const names = Array.isArray(item.attachments) ? item.attachments.filter((name): name is string => typeof name === "string") : [];
+          const files: Attachment[] = [], missing: string[] = [];
+          for (const name of names) {
+            // Historic rows only recorded labels. Recover exact local basenames, never arbitrary paths.
+            const candidate = attachmentRoot && name === nodePath.basename(name) ? nodePath.join(attachmentRoot, name) : undefined;
+            try {
+              if (!candidate || !fs.lstatSync(candidate).isFile() || nodePath.dirname(fs.realpathSync(candidate)) !== fs.realpathSync(attachmentRoot!)) throw new Error("missing");
+              files.push({ name, path: candidate });
+            } catch { missing.push(name); }
+          }
+          const identicalRows = (record.items ?? []).filter(value => {
+            const row = value as { role?: string; text?: string; attachments?: string[] } | null;
+            return row?.role === "user" && row.text === item.text && JSON.stringify(row.attachments ?? []) === JSON.stringify(names);
+          }).length;
+          const matches = identicalRows !== 1 ? [] : (record.chatLog ?? []).flatMap((entry, cut) => {
+            if (entry.role !== "user") return [];
+            if (!names.length) return entry.text === clipLog(item.text as string) ? [{ entry, cut, originalFiles: [] as Attachment[] }] : [];
+            // The retained host log preserves the original attachment block even when a file is gone.
+            const prefix = `${item.text}\n\nПриложенные файлы:\n`;
+            if (!entry.text.startsWith(prefix)) return [];
+            const lines = entry.text.slice(prefix.length).split("\n");
+            if (lines.length !== names.length) return [];
+            const originalFiles: Attachment[] = [];
+            for (const [i, line] of lines.entries()) {
+              const match = /^- (.+?)(?: \(изображение — открой и рассмотри\))?$/.exec(line);
+              if (!match || !nodePath.isAbsolute(match[1]) || nodePath.basename(match[1]) !== names[i]) return [];
+              originalFiles.push({ name: names[i], path: match[1] });
+            }
+            if (entry.text !== `${item.text}\n\n${buildAttachmentsBlock(originalFiles)}`) return [];
+            return [{ entry, cut, originalFiles }];
+          });
+          const match = matches.length === 1 ? matches[0] : undefined;
+          message = { messageId, agent: match?.entry.agent ?? record.preferredAgent ?? "claude", kind: "prompt", text: item.text,
+            attachmentFiles: files, ...(missing.length ? { missingAttachmentNames: missing } : {}),
+            ...(match ? { logCut: match.cut, providerInput: match.originalFiles.length ? `${buildAttachmentsBlock(match.originalFiles)}\n\n${item.text}` : item.text } :
+              { editUnavailableReason: missing.length ? "Не удалось восстановить исходные вложения этого сообщения." : "Исходное сообщение не найдено однозначно в сохранённом контексте." }) };
+          messages[messageId] = message;
+        }
+      }
+      const { sentMessage: _ignored, ...safe } = item;
+      return { ...safe, text: message.text, ...(message.attachmentFiles.length ? { attachments: message.attachmentFiles.map(file => file.name) } : {}), sentMessage: this.displaySentMessage(message) };
+    });
+    return { ...record, items, sentMessages: messages };
+  }
+
+  /** Only the surface's current durable binding may be edited or receive an attachment. */
+  private messageEditBinding(path: string | undefined, chatId: string | undefined, source: "vscode" | "remote", surface?: string) {
+    const board = source === "vscode" && surface === "multi-panel";
+    if ((board && !chatId) || (!board && chatId)) return undefined;
+    const slot = this.findChatSlot(chatId);
+    if (chatId && !slot) return undefined;
+    const project = chatId ? this.getProjects().find(entry => projectKey(entry) === slot?.projectPath) : this.getActiveProject();
+    if (!project || (path && path !== projectKey(project))) return undefined;
+    const key = projectKey(project), store = this.getProjectStore(key);
+    const record = store.sessions.find(entry => entry.id === (slot?.recordId ?? store.activeId));
+    return record ? { key, project, record, slot } : undefined;
+  }
+
+  private messageEditTarget(msg: Extract<WebviewToHost, { type: "prepareMessageEdit" | "editMessage" }>, source: "vscode" | "remote", surface?: string) {
+    if (typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 160 ||
+        typeof msg.recordId !== "string" || !msg.recordId || typeof msg.messageId !== "string" || !msg.messageId) throw new Error("Некорректный запрос редактирования.");
+    const binding = this.messageEditBinding(msg.path, msg.chatId, source, surface);
+    if (!binding || binding.record.id !== msg.recordId) throw new Error("Чат или сессия изменились. Откройте сообщение заново.");
+    const canonical = this.canonicalMessageRecord(binding.record, binding.key);
+    const message = canonical.sentMessages?.[msg.messageId];
+    const index = canonical.items.findIndex(value => value && typeof value === "object" &&
+      (value as { role?: string }).role === "user" && (value as { sentMessage?: SentUserMessage }).sentMessage?.messageId === msg.messageId);
+    if (!message || index < 0) throw new Error("Исходное сообщение больше не найдено в этой сессии.");
+    return { ...binding, canonical, message, index };
+  }
+
+  private missingMessageAttachments(message: StoredSentMessage): string[] {
+    return [...(message.missingAttachmentNames ?? []), ...message.attachmentFiles.filter(file => {
+      try { return !fs.statSync(file.path).isFile(); } catch { return true; }
+    }).map(file => file.name)];
+  }
+
+  private async prepareMessageEdit(msg: Extract<WebviewToHost, { type: "prepareMessageEdit" }>, source: "vscode" | "remote", surface?: string) {
+    let key = msg.path ?? this.getActiveProjectKey() ?? "";
+    try {
+      const target = this.messageEditTarget(msg, source, surface); key = target.key;
+      const { message } = target;
+      if (message.kind !== "prompt" || message.editUnavailableReason) throw new Error(message.editUnavailableReason ?? "Это сообщение не поддерживает редактирование.");
+      const availableAttachments = message.attachmentFiles.filter(file => {
+        try { return fs.statSync(file.path).isFile(); } catch { return false; }
+      });
+      this.postScoped(key, { type: "messageEditPrepared", requestId: msg.requestId, sourceRecordId: msg.recordId, messageId: msg.messageId,
+        agent: message.agent, text: message.text, attachments: availableAttachments, missingAttachments: this.missingMessageAttachments(message) }, msg.chatId);
+    } catch (error) {
+      this.postScoped(key, { type: "messageEditPrepared", requestId: msg.requestId, sourceRecordId: msg.recordId, messageId: msg.messageId,
+        error: error instanceof Error ? error.message : String(error) }, source === "vscode" && surface === "multi-panel" ? msg.chatId : undefined);
+    }
+  }
+
+  private backendFor(agent: AgentId): AgentBackend {
+    return agent === "codex" && vscode.workspace.getConfiguration("agentHub.codex").get<string>("transport", "appServer") === "exec"
+      ? this.codexExec : this.backends[agent];
+  }
+
+  private async editMessage(msg: Extract<WebviewToHost, { type: "editMessage" }>, source: "vscode" | "remote", surface?: string) {
+    const chatId = source === "vscode" && surface === "multi-panel" ? msg.chatId : undefined;
+    let key = msg.path ?? this.getActiveProjectKey() ?? "";
+    const acknowledge = (ok: boolean, recordId?: string, error?: string) => this.postScoped(key,
+      { type: "editMessageResult", requestId: msg.requestId, sourceRecordId: msg.recordId, ok, ...(recordId ? { recordId } : {}), ...(error ? { error } : {}) }, chatId);
+    const controller = new AbortController();
+    const requireActive = () => { if (controller.signal.aborted) throw new Error("Редактирование отменено."); };
+    const preparations = this.messageEditPreparations ??= new Map();
+    const requests = this.messageEditRequests ??= new Set();
+    let runKey = "", writerKeys: string[] = [], branchId: string | undefined, failureRecordId: string | undefined;
+    let captured: ReturnType<ChatViewProvider["messageEditTarget"]> | undefined;
+    let fingerprint = "";
+    try {
+      // This short queue owns admission only. The provider RPC deliberately runs outside it.
+      await this.serializeMultiMutation(async () => {
+        captured = this.messageEditTarget(msg, source, surface); key = captured.key;
+        runKey = chatId ?? key;
+        const requestKey = JSON.stringify([runKey, msg.requestId]);
+        if (requests.has(requestKey)) throw new Error("Этот запрос редактирования уже обработан или выполняется.");
+        requests.add(requestKey);
+        if (requests.size > 1000) requests.delete(requests.values().next().value!);
+        const { message, record } = captured;
+        if (this.runs.has(runKey) || preparations.has(runKey)) throw new Error("В этом чате уже выполняется ход или редактирование.");
+        if (message.kind !== "prompt" || message.editUnavailableReason || message.logCut === undefined || message.logCut < 0) throw new Error(message.editUnavailableReason ?? "Для этого сообщения не сохранена точная граница контекста.");
+        if (typeof msg.text !== "string" || (!msg.text.trim() && !msg.attachments?.length) || !Array.isArray(msg.attachments) || msg.attachments.length > 100 ||
+            msg.attachments.some(file => !file || typeof file.name !== "string" || typeof file.path !== "string" || !file.path || !nodePath.isAbsolute(file.path))) throw new Error("Некорректный текст или вложения сообщения.");
+        for (const file of msg.attachments) {
+          try { if (!fs.statSync(file.path).isFile()) throw new Error("not a file"); }
+          catch { throw new Error(`Вложение «${file.name}» недоступно. Удалите его или выберите файл заново.`); }
+        }
+        const sessionId = record.agentIds[message.agent];
+        if (!sessionId) throw new Error("У исходного сообщения нет доступной нативной сессии.");
+        writerKeys = [`edit-record:${key}:${record.id}`, `record:${key}:${record.id}:${message.agent}`, `session:${message.agent}:${sessionId}`];
+        if (writerKeys.some(writer => this.sessionWriters.has(writer)) ||
+            [...this.sessionWriters.keys()].some(writer => writer.startsWith(`record:${key}:${record.id}:`))) throw new Error("Исходная сессия уже используется другим чатом.");
+        for (const writer of writerKeys) this.sessionWriters.set(writer, controller);
+        preparations.set(runKey, { controller, projectPath: key, directory: physicalDirectory(captured.project.path), recordId: record.id });
+        fingerprint = JSON.stringify([record.createdAt, record.agentIds, message, captured.index, captured.canonical.chatLog]);
+        this.postScoped(key, { type: "busy", value: true }, chatId);
+        this.postScoped(key, { type: "activity", label: "Подготавливаю ветку до сообщения…" }, chatId);
+      });
+      const target = captured!;
+      const { message } = target;
+      const backend = this.backendFor(message.agent);
+      if (!backend.prepareEdit) throw new Error("Этот транспорт не поддерживает нативное редактирование сообщений.");
+      const serverEnv = buildServerEnvironment(await this.getSecretEnv(key), await this.context.secrets.get(this.passwordKey(key)));
+      requireActive();
+      const prepared = await backend.prepareEdit({ cwd: target.project.path, sessionId: target.record.agentIds[message.agent]!,
+        anchor: message.anchor, legacyPrompt: message.anchor ? undefined : message.providerInput ?? message.text,
+        signal: controller.signal, config: this.buildAgentConfig(message.agent, target.record.modelOverrides?.[message.agent], target.record.effortOverrides?.[message.agent]),
+        extraEnv: serverEnv, cliPath: message.agent === "claude" ? this.resolveClaudeCli() : undefined });
+      let turn: Promise<void> | undefined;
+      await this.serializeMultiMutation(async () => {
+        if (controller.signal.aborted || preparations.get(runKey)?.controller !== controller) throw new Error("Редактирование отменено.");
+        const current = this.messageEditTarget(msg, source, surface);
+        if (current.project.path !== target.project.path || JSON.stringify([current.record.createdAt, current.record.agentIds, current.message, current.index, current.canonical.chatLog]) !== fingerprint ||
+            writerKeys.some(writer => this.sessionWriters.get(writer) !== controller)) throw new Error("Исходный чат изменился во время подготовки. Откройте сообщение заново.");
+        for (const file of msg.attachments) {
+          try { if (!fs.statSync(file.path).isFile()) throw new Error("not a file"); }
+          catch { throw new Error(`Вложение «${file.name}» стало недоступно. Выберите файл заново.`); }
+        }
+        const prefix = current.canonical.items.slice(0, current.index), logCut = current.message.logCut!;
+        const branch = this.createRecord(prefix);
+        branch.agentIds[message.agent] = prepared.resumeSessionId ?? null;
+        branch.preferredAgent = message.agent;
+        branch.chatLog = structuredClone((current.canonical.chatLog ?? []).slice(0, logCut));
+        const seenBefore = current.message.seenBefore;
+        branch.chatSeen = prepared.resumeSessionId ? { [message.agent]: typeof seenBefore === "number" && Number.isSafeInteger(seenBefore) && seenBefore >= 0
+          ? Math.min(seenBefore, logCut) : 0 } : {};
+        branch.modelOverrides = current.record.modelOverrides?.[message.agent] ? { [message.agent]: current.record.modelOverrides[message.agent] } : {};
+        branch.effortOverrides = current.record.effortOverrides?.[message.agent] ? { [message.agent]: current.record.effortOverrides[message.agent] } : {};
+        if (isTaskState(current.record.task)) branch.task = structuredClone(current.record.task);
+        branch.sentMessages = {};
+        for (const value of prefix) {
+          const id = value && typeof value === "object" ? (value as { sentMessage?: SentUserMessage }).sentMessage?.messageId : undefined;
+          const original = id ? current.canonical.sentMessages?.[id] : undefined;
+          if (!original) continue;
+          const retained = structuredClone(original);
+          if (retained.agent === message.agent) {
+            if (retained.anchor?.provider === message.agent) {
+              const oldId = retained.anchor.provider === "codex" ? retained.anchor.turnId : retained.anchor.userMessageUuid;
+              const remapped = prepared.remappedAnchors?.[oldId];
+              if (remapped) retained.anchor = remapped;
+              else if (prepared.resumeSessionId && retained.anchor.provider === "codex") retained.anchor.sessionId = prepared.resumeSessionId;
+              else delete retained.anchor;
+            }
+          } else {
+            delete retained.anchor;
+            retained.editUnavailableReason ??= "Нативная сессия этого агента не перенесена в эту ветку.";
+          }
+          branch.sentMessages![retained.messageId] = retained;
+        }
+        const sourceRecordId = current.record.id, sourceCreatedAt = current.record.createdAt;
+        const previousSlot = current.slot ? { ...current.slot } : undefined;
+        try {
+          await this.mutateProjectStore(key, store => { store.sessions.push(branch); if (!chatId) store.activeId = branch.id; });
+          requireActive();
+          if (chatId) await this.saveChatSlots(this.getChatSlots().map(slot => slot.chatId === chatId ? { ...slot, recordId: branch.id, agent: message.agent } : slot));
+          requireActive();
+          if (chatId) await this.postMultiState(chatId); else this.postFullState();
+          requireActive();
+          acknowledge(true, branch.id);
+          branchId = branch.id;
+          for (const writer of writerKeys) if (this.sessionWriters.get(writer) === controller) this.sessionWriters.delete(writer);
+          if (preparations.get(runKey)?.controller === controller) preparations.delete(runKey);
+          // Register the new branch's writer before another send can be admitted.
+          requireActive();
+          turn = this.runTurn(msg.text, message.agent, msg.attachments.map(file => ({ name: file.name, path: file.path })), key, true, undefined, chatId, true);
+        } catch (error) {
+          if (!branchId) {
+            try {
+              const sourceExists = () => this.getProjectStore(key).sessions.some(entry => entry.id === sourceRecordId && entry.createdAt === sourceCreatedAt);
+              const slot = this.findChatSlot(chatId);
+              if (previousSlot && slot?.projectPath === key && slot.recordId === branch.id) {
+                if (!sourceExists()) throw new Error("Исходная сессия изменилась до отката.");
+                await this.saveChatSlots(this.getChatSlots().map(entry => entry.chatId === chatId && entry.projectPath === key && entry.recordId === branch.id
+                  ? previousSlot : entry));
+              }
+              await this.mutateProjectStore(key, store => {
+                const ownedBranch = store.sessions.some(entry => entry.id === branch.id && entry.createdAt === branch.createdAt);
+                if (!ownedBranch) return false;
+                if (store.activeId === branch.id) {
+                  if (!sourceExists()) throw new Error("Исходная сессия изменилась до отката.");
+                  store.activeId = sourceRecordId;
+                }
+                // Another binding or an uncertain board write may still own this branch.
+                if (store.activeId !== branch.id && !this.savedBoardRecordIds(key).has(branch.id)) {
+                  store.sessions = store.sessions.filter(entry => entry.id !== branch.id || entry.createdAt !== branch.createdAt);
+                }
+              });
+            } catch (rollbackError) {
+              const actualId = chatId ? this.findChatSlot(chatId)?.recordId : this.getProjectStore(key).activeId;
+              error = new Error(`${error instanceof Error ? error.message : String(error)} Не удалось восстановить исходную привязку: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}. Текущая сессия: ${actualId ?? "нет"}. Подготовленная ветка сохранена.`);
+            }
+            failureRecordId = chatId ? this.findChatSlot(chatId)?.recordId : this.getProjectStore(key).activeId ?? undefined;
+            try {
+              if (chatId) await this.postMultiState(chatId); else this.postFullState();
+            } catch (hydrationError) {
+              error = new Error(`${error instanceof Error ? error.message : String(error)} Не удалось показать текущую сессию ${failureRecordId ?? "нет"}: ${hydrationError instanceof Error ? hydrationError.message : String(hydrationError)}`);
+            }
+          }
+          throw error;
+        }
+      });
+      await turn;
+    } catch (error) {
+      if (!branchId) acknowledge(false, failureRecordId, error instanceof Error ? error.message : String(error));
+      else this.postScoped(key, { type: "error", message: error instanceof Error ? error.message : String(error) }, chatId);
+    } finally {
+      for (const writer of writerKeys) if (this.sessionWriters.get(writer) === controller) this.sessionWriters.delete(writer);
+      if (preparations.get(runKey)?.controller === controller) {
+        preparations.delete(runKey);
+        this.postScoped(key, { type: "busy", value: this.runs.has(runKey) }, chatId);
+      }
+    }
+  }
+
   private postTaskState(projectPath: string, record: SessionRecord | null | undefined, chatId?: string, requestId?: string, error?: string) {
     const task = isTaskState(record?.task) ? record.task : undefined;
     const invalidSavedTask = record?.task !== undefined && !task;
@@ -2895,7 +3219,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (active) {
       const rec = this.getActiveRecord(projectKey(active));
       this.postRecordAgent(projectKey(active), rec);
-      this.post({ type: "transcript", path: projectKey(active), items: rec?.items ?? [] });
+      this.post({ type: "transcript", path: projectKey(active), items: rec ? this.canonicalMessageRecord(rec, projectKey(active)).items : [], recordId: rec?.id });
       this.postTaskState(projectKey(active), rec);
       // Скоуп обязателен: burst идёт до ре-рендера webview, и фолбэк на
       // activeRef разложил бы состояние под старым проектом (баг из ревью).
@@ -3902,6 +4226,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           current.modelOverrides = {};
           this.applyAgentChoice(current, selected);
           current.lastPrompts = {};
+          current.sentMessages = {};
           delete current.task;
         } else {
           keptPrevious = !!current;
@@ -3937,7 +4262,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const chatEvents = new Set([
       "projects", "transcript", "busy", "activity", "sessionInfo", "userMessage",
       "textDelta", "assistantText", "toolUse", "turnResult", "info", "error", "reset",
-      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled", "taskState",
+      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled", "taskState", "messageEditPrepared", "editMessageResult", "attachmentAdded",
     ]);
     if (!chatEvents.has(msg.type)) this.multiPanel?.webview.postMessage(msg);
     this.remote?.broadcast(msg);
@@ -4026,6 +4351,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     switch (msg.type) {
+      case "prepareMessageEdit":
+        await this.prepareMessageEdit(msg, source, surface);
+        break;
+      case "editMessage":
+        await this.editMessage(msg, source, surface);
+        break;
       case "saveTaskState":
         await this.saveTaskState(msg, source, surface);
         break;
@@ -4070,6 +4401,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const slot = this.findChatSlot(msg.chatId);
         const requested = msg.path ?? this.getActiveProjectKey();
         const target = msg.chatId ?? requested;
+        if (target) this.messageEditPreparations?.get(target)?.controller.abort();
         // Ищем, что останавливать: запрошенный проект → единственный запуск.
         const runTarget =
           target && this.runs.has(target)
@@ -4078,12 +4410,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               ? [...this.runs.keys()][0]
               : undefined;
         if (runTarget) {
+          const controller = this.runs.get(runTarget);
           this.postScoped(slot?.projectPath ?? requested ?? "", { type: "activity", label: "Останавливаю…" }, msg.chatId);
-          this.runs.get(runTarget)?.abort();
+          controller?.abort();
           this.denyAllPending(slot?.projectPath ?? requested, msg.chatId);
           // Страховка: бэкенд не завершился за 6 с — принудительно чистим UI.
           setTimeout(() => {
-            if (this.runs.has(runTarget)) {
+            if (controller && this.runs.get(runTarget) === controller) {
               this.runs.delete(runTarget);
               this.postScoped(slot?.projectPath ?? requested ?? "", { type: "busy", value: false }, msg.chatId);
               this.postScoped(slot?.projectPath ?? requested ?? "", {
@@ -4136,16 +4469,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const channel = target ? this.steers.get(runKey) : undefined;
         if (!target || !this.runs.has(runKey) || !channel?.handler) {
           // Ход уже закончился или агент не принимает сообщения на лету — обычная отправка.
-          await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], target, true, undefined, msg.chatId);
+          await this.runTurn(msg.text, msg.agent, msg.attachments ?? [], target, true, undefined, msg.chatId, false, "steer");
           break;
         }
         const project = this.getProjects().find((p) => projectKey(p) === target);
         if (!project) break;
         const files = await this.relocateAttachments(project.path, msg.attachments ?? [], target);
         const text = files.length > 0 ? `${buildAttachmentsBlock(files)}\n\n${msg.text}` : msg.text;
+        const record = slot ? this.getProjectStore(target).sessions.find(entry => entry.id === slot.recordId) : this.getActiveRecord(target);
+        const sentMessage = record ? await this.recordSentMessage(target, record.id, record.createdAt, msg.text, msg.agent, "steer", files) : undefined;
         this.postScoped(target, {
-          type: "userMessage",
-          text: msg.text,
+          type: "userMessage", text: msg.text, recordId: record?.id, sentMessage,
           attachments: files.length > 0 ? files.map((a) => a.name) : undefined,
         }, msg.chatId);
         try {
@@ -4165,30 +4499,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             type: "info",
             text: `Докинуть в идущий ход не удалось (${err instanceof Error ? err.message : err}) — сообщение уйдёт после завершения хода.`,
           }, msg.chatId);
-          this.deferTurn(target, msg.agent, msg.text, undefined, msg.chatId);
+          this.deferTurn(target, msg.agent, msg.text, undefined, msg.chatId, "steer");
         }
         break;
       }
       case "pickAttachment": {
         const slot = this.findChatSlot(msg.chatId);
         const target = slot?.projectPath ?? msg.path ?? this.getActiveProjectKey();
+        const binding = this.captureAttachmentBinding(msg.path, msg.chatId, msg.draftContext);
+        if (!binding) break;
         const picked = await vscode.window.showOpenDialog({
           canSelectFiles: true,
           canSelectFolders: false,
           canSelectMany: true,
           openLabel: "Прикрепить",
         });
-        if (picked?.length) {
+        if (picked?.length && this.attachmentBindingCurrent(binding, msg.chatId, msg.draftContext)) {
           const event: HostToWebview = {
             type: "attachmentAdded",
             files: picked.map((u) => ({ name: nodePath.basename(u.fsPath), path: u.fsPath })),
+            ...(msg.draftContext ? { draftContext: msg.draftContext } : {}),
           };
           if (target) this.postScoped(target, event, msg.chatId);
         }
         break;
       }
       case "saveAttachment":
-        await this.saveAttachment(msg.name, msg.dataBase64, msg.path, msg.chatId);
+        await this.saveAttachment(msg.name, msg.dataBase64, msg.path, msg.chatId, msg.draftContext);
         break;
       case "finishSession":
         await this.finishSession(msg.agent, msg.chatId);
@@ -4226,16 +4563,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.manageProjects(msg.chatId);
         break;
       case "saveTranscript": {
+        if (!Array.isArray(msg.items) || typeof msg.recordId !== "string" || !msg.recordId ||
+            (surface === "multi-panel" ? !msg.chatId : !!msg.chatId)) break;
         let titleChanged = false;
         await this.mutateProjectStore(msg.path, store => {
           const slot = this.findChatSlot(msg.chatId);
           const rec = msg.chatId
             ? (slot?.projectPath === msg.path && slot.recordId === msg.recordId
               ? store.sessions.find((s) => s.id === slot.recordId) : undefined)
-            : store.sessions.find((s) => s.id === store.activeId);
+            : store.activeId === msg.recordId ? store.sessions.find((s) => s.id === msg.recordId) : undefined;
           if (!rec) return false;
           const previousTitle = rec.title;
-          rec.items = msg.items.slice(-TRANSCRIPT_MAX_ITEMS);
+          // Ignore all renderer-provided anchors, cuts and prompt text metadata.
+          const sanitizedItems = msg.items.slice(-TRANSCRIPT_MAX_ITEMS).map(value => {
+            if (!value || typeof value !== "object") return value;
+            const item = value as Record<string, unknown>;
+            const id = (item.sentMessage as Partial<SentUserMessage> | undefined)?.messageId;
+            const known = typeof id === "string" ? rec.sentMessages?.[id] : undefined;
+            const { sentMessage: _untrusted, ...safe } = item;
+            return known && known.text === item.text ? { ...safe, sentMessage: this.displaySentMessage(known) } : safe;
+          });
+          const canonical = this.canonicalMessageRecord({ ...rec, items: sanitizedItems }, msg.path);
+          rec.items = sanitizedItems;
+          rec.sentMessages = canonical.sentMessages;
           rec.updatedAt = Date.now();
           if (rec.title === "Новая сессия") {
             rec.title = deriveTitle(rec.items) ?? rec.title;
@@ -4322,10 +4672,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Сохранить вставленный/перетащенный файл в <проект>/.agent-hub/attachments/. */
-  private async saveAttachment(name: string, dataBase64: string, projectPath?: string, chatId?: string) {
+  private captureAttachmentBinding(projectPath?: string, chatId?: string, draftContext?: AttachmentDraftContext) {
+    const slot = this.findChatSlot(chatId);
+    if (chatId && !slot) return undefined;
+    const key = slot?.projectPath ?? projectPath ?? this.getActiveProjectKey();
+    if (!key || (projectPath && projectPath !== key)) return undefined;
+    const record = slot ? this.getProjectStore(key).sessions.find(entry => entry.id === slot.recordId) : this.getActiveRecord(key);
+    if (draftContext && (typeof draftContext.draftId !== "string" || !draftContext.draftId || draftContext.draftId.length > 160 ||
+      (draftContext.uploadId !== undefined && (typeof draftContext.uploadId !== "string" || !draftContext.uploadId || draftContext.uploadId.length > 160)) ||
+      !record || draftContext.recordId !== record.id)) return undefined;
+    return { key, recordId: record?.id, createdAt: record?.createdAt };
+  }
+
+  private attachmentBindingCurrent(binding: { key: string; recordId?: string; createdAt?: number }, chatId?: string, draftContext?: AttachmentDraftContext) {
+    const current = this.captureAttachmentBinding(binding.key, chatId, draftContext);
+    return !!current && current.key === binding.key && current.recordId === binding.recordId && current.createdAt === binding.createdAt;
+  }
+
+  private async saveAttachment(name: string, dataBase64: string, projectPath?: string, chatId?: string, draftContext?: AttachmentDraftContext) {
     // Проект — тот, чья лента прислала файл: «активный» хоста мог отличаться
     // (переключение, другое окно), и вложение уезжало в чужую папку.
     const slot = this.findChatSlot(chatId);
+    const binding = this.captureAttachmentBinding(projectPath, chatId, draftContext);
+    if (!binding) return;
     if (chatId && !slot) return;
     if (slot && projectPath && projectPath !== slot.projectPath) return;
     projectPath = slot?.projectPath ?? projectPath;
@@ -4337,20 +4706,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
+      if (typeof name !== "string" || !name.trim() || name.length > 255 || /[\\/\x00-\x1f]/.test(name)) throw new Error("Некорректное имя вложения.");
       const dir = nodePath.join(project.path, ".agent-hub", "attachments");
       await fs.promises.mkdir(dir, { recursive: true });
+      if (!this.attachmentBindingCurrent(binding, chatId, draftContext)) return;
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const safeName = name.replace(/[^\wа-яА-ЯёЁ.\-]+/g, "_") || "file";
       const filePath = nodePath.join(dir, `${stamp}-${randomUUID()}-${safeName}`);
       await fs.promises.writeFile(filePath, Buffer.from(dataBase64, "base64"));
+      if (!this.attachmentBindingCurrent(binding, chatId, draftContext)) return;
       this.postScoped(projectKey(project), {
         type: "attachmentAdded",
-        files: [{ name: nodePath.basename(filePath), path: filePath }],
+        files: [{ name, path: filePath }],
+        ...(draftContext ? { draftContext } : {}),
       }, chatId);
     } catch (err) {
+      if (!this.attachmentBindingCurrent(binding, chatId, draftContext)) return;
       const event: HostToWebview = {
         type: "error",
         message: `Не удалось сохранить вложение: ${err instanceof Error ? err.message : err}`,
+        ...(draftContext ? { draftContext } : {}),
       };
       if (project) this.postScoped(projectKey(project), event, chatId);
       else this.post(event);
@@ -4422,7 +4797,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ход после завершения текущего (или сразу, если проект свободен). */
-  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin, chatId?: string) {
+  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin, chatId?: string, messageKind?: UserMessageKind) {
     if (questionOrigin && !this.isQuestionOriginCurrent(cwd, agent, questionOrigin)) {
       this.reportExpiredQuestion(cwd, chatId);
       return false;
@@ -4430,11 +4805,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const runKey = chatId ?? cwd;
     if (this.runs.has(runKey)) {
       const list = this.deferred.get(runKey) ?? [];
-      list.push({ prompt, agent, chatId, questionOrigin });
+      list.push({ prompt, agent, chatId, questionOrigin, messageKind });
       this.deferred.set(runKey, list);
       return true;
     }
-    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin, chatId);
+    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin, chatId, false, messageKind);
     return true;
   }
 
@@ -4625,6 +5000,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** При выгрузке расширения: оборвать все ходы и добить процессы агентов. */
   abortAll() {
     for (const c of this.runs.values()) c.abort();
+    for (const preparation of this.messageEditPreparations?.values() ?? []) preparation.controller.abort();
     killAllCodex();
     this.remote?.stop();
     this.remote = null;
@@ -4639,12 +5015,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     expectedQuestionOrigin?: QuestionOrigin,
     chatId?: string,
     admitted = false,
+    messageKindOverride?: UserMessageKind,
   ): Promise<void> {
     if (!admitted) {
       let turn: Promise<void> | undefined;
       // Serialize only binding capture and run registration, never the running agent.
       await this.serializeMultiMutation(async () => {
-        turn = this.runTurn(prompt, agent, attachments, targetPath, echoUser, expectedQuestionOrigin, chatId, true);
+        turn = this.runTurn(prompt, agent, attachments, targetPath, echoUser, expectedQuestionOrigin, chatId, true, messageKindOverride);
       });
       await turn;
       return;
@@ -4712,6 +5089,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let releaseWriter: () => void = () => {};
     try {
 
+    // Новая сессия — карточка проекта + контекст из журнала (общая память).
+    const store = this.getProjectStore(cwd);
+    let record = slot ? store.sessions.find((item) => item.id === slot.recordId) : null;
+    if (!record && slot) {
+      emit({ type: "error", message: "Сессия чата удалена из истории." });
+      return;
+    }
+    record ??= await this.ensureActiveRecord(cwd);
+    const writerKeys = [`record:${cwd}:${record.id}:${agent}`];
+    if (record.agentIds[agent]) writerKeys.push(`session:${agent}:${record.agentIds[agent]}`);
+    const conflictingWriter = this.sessionWriters.has(`edit-record:${cwd}:${record.id}`) || writerKeys.find((key) => this.sessionWriters.has(key));
+    if (conflictingWriter) {
+      emit({ type: "error", message: "Эта CLI-сессия уже запущена в другом чате. Выберите отдельную сессию." });
+      return;
+    }
+    for (const key of writerKeys) this.sessionWriters.set(key, controller);
+    releaseWriter = () => {
+      for (const key of writerKeys) if (this.sessionWriters.get(key) === controller) this.sessionWriters.delete(key);
+    };
+    const messageId = echoUser ? randomUUID() : undefined;
+    const messageKind = messageKindOverride ?? (expectedQuestionOrigin ? "question" : "prompt");
+
     // Изоляция проектов: вложение из папки ДРУГОГО проекта (старый дефект —
     // сохранялось в «активный» проект хоста) копируем сюда, чтобы агент не
     // ходил в чужую папку и не узнавал о другом проекте.
@@ -4734,13 +5133,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.reportExpiredQuestion(cwd, chatId);
       return true;
     };
+    const sentMessage = messageId ? await this.recordSentMessage(cwd, record.id, record.createdAt, prompt, agent, messageKind, attachments, messageId,
+      expectedQuestionOrigin ? () => !controller.signal.aborted && this.isQuestionOriginCurrent(cwd, agent, expectedQuestionOrigin) : undefined) : undefined;
     if (echoUser && !expectedQuestionOrigin) {
-      // Пузырь пользователя рассылает хост — обе поверхности видят одно и то же.
-      emit({
-        type: "userMessage",
-        text: prompt,
-        attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
-      });
+      emit({ type: "userMessage", text: prompt, recordId: record.id, sentMessage,
+        attachments: attachments.length ? attachments.map((a) => a.name) : undefined });
     }
     emit({ type: "busy", value: true });
     emit({ type: "activity", label: "Запускается…" });
@@ -4783,26 +5180,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         : `${attachBlock}\n\n${userText}`
       : userText;
 
-    // Новая сессия — карточка проекта + контекст из журнала (общая память).
-    const store = this.getProjectStore(cwd);
-    let record = slot ? store.sessions.find((item) => item.id === slot.recordId) : null;
-    if (!record && slot) {
-      emit({ type: "error", message: "Сессия чата удалена из истории." });
-      return;
-    }
-    record ??= await this.ensureActiveRecord(cwd);
-    const writerKeys = [`record:${cwd}:${record.id}:${agent}`];
-    if (record.agentIds[agent]) writerKeys.push(`session:${agent}:${record.agentIds[agent]}`);
-    const conflictingWriter = writerKeys.find((key) => this.sessionWriters.has(key));
-    if (conflictingWriter) {
-      emit({ type: "error", message: "Эта CLI-сессия уже запущена в другом чате. Выберите отдельную сессию." });
-      return;
-    }
-    for (const key of writerKeys) this.sessionWriters.set(key, controller);
-    releaseWriter = () => {
-      for (const key of writerKeys) if (this.sessionWriters.get(key) === controller) this.sessionWriters.delete(key);
-    };
-    if (discardStaleQuestion()) return;
     const sessions = record.agentIds;
 
     // Контекст между агентами: лента чата общая, а CLI-сессии раздельные.
@@ -4810,8 +5187,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // их в промпт. Slash-команды пропускаем: их промпт обязан начинаться с «/».
     const chatLog = record.chatLog ?? [];
     const seenIdx = Math.min(record.chatSeen?.[agent] ?? 0, chatLog.length);
-    const unseen = chatLog.slice(seenIdx).filter((e) => e.agent !== agent);
-    const crossContext = isSlashCommand ? null : buildCrossContext(unseen);
+    const unseen = sessions[agent] ? chatLog.slice(seenIdx).filter((e) => e.agent !== agent) : chatLog;
+    const crossContext = isSlashCommand ? null : buildCrossContext(unseen, !sessions[agent]);
     if (crossContext) {
       emit({
         type: "info",
@@ -4879,6 +5256,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Точный промпт хода — для просмотрщика контекста («🧠 что видит агент»).
     if (discardStaleQuestion()) return;
     await mutateTurnRecord((r) => {
+      if (messageId && r.sentMessages?.[messageId]) {
+        const metadata = r.sentMessages[messageId];
+        metadata.providerInput = promptWithAttachments;
+        if (messageKind === "prompt") metadata.seenBefore = sessions[agent] ? seenIdx : 0;
+      }
       r.lastPrompts = {
         ...r.lastPrompts,
         [agent]:
@@ -4892,7 +5274,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       if (echoUser && expectedQuestionOrigin) {
         emit({
-          type: "userMessage", text: prompt,
+          type: "userMessage", text: prompt, recordId: record.id, sentMessage,
           attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
         });
       }
@@ -4906,6 +5288,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const steer: SteerChannel = {};
       this.steers.set(runKey, steer);
       const events = backend.start(fullPrompt, {
+        messageId,
         cwd: workingDir,
         resumeSessionId: sessions[agent] ?? undefined,
         signal: controller.signal,
@@ -4924,11 +5307,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // «увиденным» — иначе другой агент потеряет эти сообщения навсегда.
       for await (const ev of events) {
         switch (ev.kind) {
+          case "nativePrompt":
+            if (messageKind === "prompt" && messageId && ev.messageId === messageId && ev.anchor.provider === agent) await mutateTurnRecord(r => {
+              const metadata = r.sentMessages?.[messageId];
+              if (metadata) metadata.anchor = ev.anchor;
+            });
+            break;
           case "session":
             currentSessionId = ev.sessionId;
             delivered = true;
             await mutateTurnRecord((r) => {
               r.agentIds[agent] = ev.sessionId;
+              if (agent === "codex" && ev.forkedFromSessionId) {
+                for (const message of Object.values(r.sentMessages ?? {})) {
+                  if (message.anchor?.provider === "codex" && message.anchor.sessionId === ev.forkedFromSessionId) message.anchor.sessionId = ev.sessionId;
+                }
+              }
             });
             emit({ type: "sessionInfo", sessionId: ev.sessionId, agent });
             break;
@@ -5007,8 +5401,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     return;
                   }
                   if (this.isQuestionOriginCurrent(cwd, agent, origin)) {
-                    emit({ type: "userMessage", text });
-                    emit({ type: "info", text: "Ответ передан агенту в текущий ход." });
+                    const sentMessage = await this.recordSentMessage(cwd, record.id, recordGen, text, agent, "question", [], undefined,
+                      () => this.isQuestionOriginCurrent(cwd, agent, origin));
+                    if (this.isQuestionOriginCurrent(cwd, agent, origin)) {
+                      emit({ type: "userMessage", text, recordId: record.id, sentMessage });
+                      emit({ type: "info", text: "Ответ передан агенту в текущий ход." });
+                    }
                   }
                   if (turnLogDone) {
                     // ACK мог прийти после финального лога и начала нового хода.
@@ -5105,7 +5503,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const logUserText = attachBlock ? `${prompt}\n\n${attachBlock}` : prompt;
       turnLogDone = mutateTurnRecord((r) => {
         const log = (r.chatLog ??= []);
-        if (echoUser) log.push({ agent, role: "user", text: clipLog(logUserText) });
+        if (echoUser) {
+          if (messageId && r.sentMessages?.[messageId]) r.sentMessages[messageId].logCut = log.length;
+          log.push({ agent, role: "user", text: clipLog(logUserText) });
+        }
         for (const t of steered) log.push({ agent, role: "user", text: clipLog(t) });
         if (answer) log.push({ agent, role: "assistant", text: clipLog(answer) });
         const seen: Partial<Record<AgentId, number>> = { ...(r.chatSeen ?? {}) };
@@ -5113,6 +5514,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const overflow = log.length - CHAT_LOG_MAX_ENTRIES;
         if (overflow > 0) {
           log.splice(0, overflow);
+          for (const metadata of Object.values(r.sentMessages ?? {})) {
+            if (metadata.seenBefore !== undefined) metadata.seenBefore = Math.max(0, metadata.seenBefore - overflow);
+            if (metadata.logCut === undefined) continue;
+            if (metadata.logCut < overflow) {
+              delete metadata.logCut;
+              delete metadata.seenBefore;
+              metadata.editUnavailableReason = "Исходная часть контекста удалена из сохранённой истории.";
+            } else metadata.logCut -= overflow;
+          }
           for (const key of Object.keys(seen) as AgentId[]) {
             seen[key] = Math.max(0, (seen[key] ?? 0) - overflow);
           }
@@ -5135,7 +5545,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (nextDeferred) {
       // The queued answer resumes this CLI session, so release this turn's writer first.
       releaseWriter();
-      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin, nextDeferred.chatId);
+      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin, nextDeferred.chatId, false, nextDeferred.messageKind);
     }
     } finally {
       releaseWriter();

@@ -1176,6 +1176,123 @@ body.resizing-composer {
   user-select: none;
 }
 
+.msg-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.msg-footer .msg-time {
+  margin-top: 0;
+}
+
+.msg-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 4px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.msg.user:hover .msg-edit,
+.msg.user:focus-within .msg-edit {
+  opacity: 0.75;
+}
+
+.msg-edit:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground);
+}
+
+.msg-edit:disabled {
+  cursor: default;
+}
+
+.msg.user .msg-edit:focus-visible,
+.attach-remove:focus-visible,
+.message-edit-actions button:focus-visible {
+  opacity: 1;
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+@media (hover: none) {
+  .msg-edit { opacity: 0.75; }
+}
+
+.message-edit-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--vscode-focusBorder);
+  background: var(--vscode-textBlockQuote-background, var(--vscode-input-background));
+  font-size: 0.9em;
+}
+
+.message-edit-banner > span {
+  opacity: 0.8;
+}
+
+.message-edit-error,
+.message-edit-inline-error,
+.message-edit-missing-hint {
+  color: var(--vscode-errorForeground, #f48771);
+  font-size: 0.9em;
+}
+
+.message-edit-inline-error {
+  margin-top: 5px;
+}
+
+.missing-attachment {
+  border: 1px solid var(--vscode-inputValidation-warningBorder, #b89500);
+}
+
+.message-edit-missing-hint {
+  flex-basis: 100%;
+}
+
+.message-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.actions:has(.message-edit-actions) {
+  flex-wrap: wrap;
+}
+
+.actions .cancel-edit {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ---------- Режим доставки сообщения во время хода: сразу / на шаге / после ---------- */
 
 .actions-left {

@@ -12,10 +12,12 @@ import remarkGfm from "remark-gfm";
 import type {
   AgentId,
   Attachment,
+  AttachmentDraftContext,
   HostToWebview,
   ProjectInfo,
   SettingsSnapshot,
   SlashCommandInfo,
+  SentUserMessage,
   WebviewToHost,
 } from "../src/shared/protocol";
 
@@ -47,6 +49,7 @@ const CHAT_COMMAND_TYPES = new Set([
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
   "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
+  "prepareMessageEdit", "editMessage",
 ]);
 const CHAT_EVENT_TYPES = new Set([
   "busy", "activity", "sessionInfo", "userMessage", "transcript", "contextUsage", "modelInfo",
@@ -54,6 +57,7 @@ const CHAT_EVENT_TYPES = new Set([
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
   "agentInfo", "effortInfo", "taskState",
+  "messageEditPrepared", "editMessageResult",
 ]);
 
 interface MultiChatSlotView {
@@ -109,6 +113,7 @@ type ChatItem =
       text: string;
       streaming?: boolean;
       attachments?: string[];
+      sentMessage?: SentUserMessage;
       /** Когда сообщение появилось (Date.now, локальное время машины). */
       ts?: number;
     }
@@ -136,6 +141,31 @@ type ChatItem =
     };
 
 let nextId = 1;
+let nextDraftId = 1;
+const draftId = () => `message-draft-${Date.now()}-${nextDraftId++}`;
+
+interface MessageEditDraft {
+  draftId: string;
+  prepareRequestId: string;
+  saveRequestId?: string;
+  path: string;
+  sourceRecordId: string;
+  sourceCreatedAt?: number;
+  messageId: string;
+  agent: AgentId;
+  text: string;
+  attachments: Attachment[];
+  missingAttachments: string[];
+  pendingUploads: string[];
+  phase: "preparing" | "prepare-error" | "ready" | "saving";
+  error?: string;
+}
+
+interface AttachmentTarget {
+  path: string;
+  context: AttachmentDraftContext;
+  editing: boolean;
+}
 
 type ToolChipItem = Extract<ChatItem, { role: "tool" }>;
 
@@ -272,6 +302,17 @@ function ChatTile({
   const [agent, setAgent] = useState<AgentId>(initialAgent ?? "claude");
   const [agentReady, setAgentReady] = useState(initialAgent !== undefined);
   const [draft, setDraft] = useState("");
+  // The ordinary composer stays intact while a sent message has its own draft.
+  const [messageEdit, setMessageEdit] = useState<MessageEditDraft | null>(null);
+  const messageEditRef = useRef<MessageEditDraft | null>(null);
+  const updateMessageEdit = useCallback((value: MessageEditDraft | null) => {
+    messageEditRef.current = value;
+    setMessageEdit(value);
+  }, []);
+  const [messageEditError, setMessageEditError] = useState<{ messageId: string; text: string } | null>(null);
+  const normalAttachmentDraftRef = useRef(draftId());
+  const filePickerTargetRef = useRef<AttachmentTarget | null>(null);
+  const editTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null);
   const taskSnapshotRef = useRef<TaskSnapshot | null>(null);
   const updateTaskSnapshot = useCallback((snapshot: TaskSnapshot | null) => {
@@ -316,9 +357,21 @@ function ChatTile({
   /** Вложения черновика — свои у каждого проекта: при переключении проекта
    *  они не должны уехать в чужой чат (и в чужую папку). */
   const [pendingBy, setPendingBy] = useState<Record<string, Attachment[]>>({});
-  const pending = pendingBy[activePath] ?? [];
-  const setPending = (fn: (prev: Attachment[]) => Attachment[]) =>
-    setPendingBy((prev) => ({ ...prev, [activePath]: fn(prev[activePath] ?? []) }));
+  const normalPending = pendingBy[activePath] ?? [];
+  const pending = messageEdit ? messageEdit.attachments : normalPending;
+  const composerDraft = messageEdit ? messageEdit.text : draft;
+  const updateComposerDraft = (text: string) => {
+    const edit = messageEditRef.current;
+    if (edit) {
+      if (edit.phase === "ready") updateMessageEdit({ ...edit, text });
+    } else setDraft(text);
+  };
+  const setPending = (fn: (prev: Attachment[]) => Attachment[]) => {
+    const edit = messageEditRef.current;
+    if (edit) {
+      if (edit.phase === "ready") updateMessageEdit({ ...edit, attachments: fn(edit.attachments) });
+    } else setPendingBy((prev) => ({ ...prev, [activePath]: fn(prev[activePath] ?? []) }));
+  };
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
@@ -383,6 +436,40 @@ function ChatTile({
   const pendingAgentRef = useRef<AgentId | null>(null);
   const pendingSessionRef = useRef<string | null>(null);
   const itemRecordsRef = useRef(new WeakMap<ChatItem[], string>());
+  const replaceBinding = useCallback((projectPath: string, recordId: string | undefined) => {
+    const previous = bindingRef.current;
+    if (previous.projectPath !== projectPath || previous.recordId !== recordId) {
+      normalAttachmentDraftRef.current = draftId();
+      filePickerTargetRef.current = null;
+      const edit = messageEditRef.current;
+      if (edit && (edit.path !== projectPath || edit.sourceRecordId !== recordId)) {
+        // A successful native fork is published before its acknowledgement.
+        // Hold the submitted draft until that exact save request is acknowledged.
+        const awaitingOwnFork = edit.phase === "saving" && edit.path === projectPath && recordId &&
+          !pendingProjectRef.current && !pendingSessionRef.current && !pendingAgentRef.current;
+        if (!awaitingOwnFork) updateMessageEdit(null);
+      }
+    }
+    bindingRef.current = { projectPath, recordId };
+  }, [updateMessageEdit]);
+
+  const editMatchesSource = useCallback((edit: MessageEditDraft) => {
+    const binding = bindingRef.current;
+    const identity = taskSnapshotRef.current?.identity;
+    return binding.projectPath === edit.path && binding.recordId === edit.sourceRecordId &&
+      (!identity || edit.sourceCreatedAt === undefined || identity.recordId !== edit.sourceRecordId ||
+        identity.createdAt === edit.sourceCreatedAt);
+  }, []);
+
+  const cancelMessageEdit = useCallback((restoreFocus = true) => {
+    updateMessageEdit(null);
+    setMessageEditError(null);
+    filePickerTargetRef.current = null;
+    if (restoreFocus) {
+      const trigger = editTriggerRef.current;
+      requestAnimationFrame(() => trigger?.isConnected ? trigger.focus() : composerRef.current?.focus());
+    }
+  }, [updateMessageEdit]);
 
   // Производные значения активного проекта.
   const items = itemsByProject[activePath] ?? [];
@@ -393,6 +480,10 @@ function ChatTile({
   const models = modelsBy[activePath] ?? NO_MODELS;
   const efforts = effortsBy[activePath] ?? {};
   const queue = queueBy[activePath] ?? [];
+  const editBlocked = busy || agentSwitching || projectSwitching || !agentReady;
+  const editFormDisabled = !!messageEdit && messageEdit.phase !== "ready";
+  const editErrorId = `message-edit-error-${chatId ?? "main"}`;
+  const editHintId = `message-edit-hint-${chatId ?? "main"}`;
   const sessionId = sessions[agent];
   const activeProject = projects.find((p) => projectKey(p) === activePath);
   const elapsed = busy && busyStartBy[activePath]
@@ -431,18 +522,18 @@ function ChatTile({
   }, [itemsByProject]);
 
   // ---------- Slash-команды в композере ----------
-  const slashMatch = /^\/(\S*)$/.exec(draft);
+  const slashMatch = /^\/(\S*)$/.exec(composerDraft);
   const slashList = useMemo(() => {
-    if (!slashMatch || slashDismissed) return [];
+    if (!slashMatch || slashDismissed || messageEdit) return [];
     const prefix = slashMatch[1].toLowerCase();
     return (slashCmds[agent] ?? [])
       .filter((c) => c.name.toLowerCase().startsWith(prefix))
       .slice(0, 12);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, slashCmds, agent, slashDismissed]);
+  }, [composerDraft, slashCmds, agent, slashDismissed, messageEdit]);
 
   const pickSlash = (c: SlashCommandInfo) => {
-    setDraft(`/${c.name} `);
+    updateComposerDraft(`/${c.name} `);
     setSlashIdx(0);
   };
 
@@ -498,7 +589,8 @@ function ChatTile({
       const recordId = bindingRef.current.projectPath === path ? bindingRef.current.recordId : undefined;
       setItemsByProject((prev) => {
         const updated = updater(prev[path] ?? []);
-        if (recordId) itemRecordsRef.current.set(updated, recordId);
+        const ownedRecordId = recordId ?? itemRecordsRef.current.get(prev[path]);
+        if (ownedRecordId) itemRecordsRef.current.set(updated, ownedRecordId);
         return { ...prev, [path]: updated };
       });
     },
@@ -554,7 +646,7 @@ function ChatTile({
         case "chatProjectRejected": {
           if (!chatId || (pendingProjectRef.current && pendingProjectRef.current !== msg.requestedProjectPath)) break;
           if (!pendingProjectRef.current && bindingRef.current.projectPath !== msg.projectPath) break;
-          bindingRef.current = { projectPath: msg.projectPath, recordId: msg.recordId };
+          replaceBinding(msg.projectPath, msg.recordId);
           pendingProjectRef.current = null;
           setProjectSwitching(false);
           activeRef.current = msg.projectPath;
@@ -569,7 +661,7 @@ function ChatTile({
           const slot = msg.chats.find((entry) => entry.chatId === chatId);
           if (!slot || (pendingProjectRef.current && slot.projectPath !== pendingProjectRef.current)) break;
           if (slot.projectPath !== bindingRef.current.projectPath || slot.recordId !== bindingRef.current.recordId) updateTaskSnapshot(null);
-          bindingRef.current = { projectPath: slot.projectPath, recordId: slot.recordId };
+          replaceBinding(slot.projectPath, slot.recordId);
           pendingProjectRef.current = null;
           setProjectSwitching(false);
           activeRef.current = slot.projectPath;
@@ -611,7 +703,7 @@ function ChatTile({
               clearServerTest();
               updateTaskSnapshot(null);
               if (!chatId) {
-                bindingRef.current = { projectPath: msg.activePath, recordId: undefined };
+                replaceBinding(msg.activePath, undefined);
                 pendingAgentRef.current = null;
                 pendingSessionRef.current = null;
                 setAgentSwitching(false);
@@ -648,6 +740,9 @@ function ChatTile({
           if (previous?.identity && msg.identity && previous.identity.recordId === msg.identity.recordId &&
               (msg.identity.createdAt < previous.identity.createdAt ||
                 (msg.identity.createdAt === previous.identity.createdAt && msg.revision < previous.revision))) break;
+          const edit = messageEditRef.current;
+          if (edit?.sourceCreatedAt !== undefined && msg.identity?.recordId === edit.sourceRecordId &&
+              msg.identity.createdAt !== edit.sourceCreatedAt) updateMessageEdit(null);
           updateTaskSnapshot(msg);
           break;
         }
@@ -655,12 +750,16 @@ function ChatTile({
           if (chatId && (msg.path !== bindingRef.current.projectPath ||
               msg.recordId !== bindingRef.current.recordId ||
               (pendingProjectRef.current && msg.path !== pendingProjectRef.current))) break;
+          if (!chatId && msg.path === bindingRef.current.projectPath && msg.recordId &&
+              bindingRef.current.recordId && msg.recordId !== bindingRef.current.recordId) break;
           const restored = msg.items as ChatItem[];
           const maxId = restored.reduce((m, it) => Math.max(m, it?.id ?? 0), 0);
           if (maxId >= nextId) nextId = maxId + 1;
           setItemsByProject((prev) => {
-            // Проект стримит и локальная лента не пуста — она свежее снапшота.
-            if (busyRef.current[msg.path] && (prev[msg.path]?.length ?? 0) > 0) {
+            // Only the current record's live feed can be newer than hydration.
+            // A busy native fork must replace the source record's remaining turns.
+            if (busyRef.current[msg.path] && (prev[msg.path]?.length ?? 0) > 0 &&
+                itemRecordsRef.current.get(prev[msg.path]) === msg.recordId) {
               return prev;
             }
             // IPC creates a fresh array, but hydration is already persisted by the host.
@@ -712,7 +811,7 @@ function ChatTile({
           const recordChanged = !chatId && !!msg.recordId && bindingRef.current.recordId !== msg.recordId;
           if (!chatId && msg.recordId) {
             if (recordChanged) updateTaskSnapshot(null);
-            bindingRef.current = { projectPath: p, recordId: msg.recordId };
+            replaceBinding(p, msg.recordId);
           }
           pendingAgentRef.current = null;
           pendingSessionRef.current = null;
@@ -755,9 +854,67 @@ function ChatTile({
         case "openSettingsScreen":
           setSettingsOpen(true);
           break;
+        case "messageEditPrepared": {
+          const edit = messageEditRef.current;
+          if (!edit || edit.phase !== "preparing" || edit.prepareRequestId !== msg.requestId ||
+              edit.messageId !== msg.messageId || edit.sourceRecordId !== msg.sourceRecordId ||
+              edit.path !== p || !editMatchesSource(edit)) break;
+          if (msg.error || msg.text === undefined || !msg.agent) {
+            const error = msg.error || "Не удалось загрузить исходное сообщение.";
+            updateMessageEdit({ ...edit, phase: "prepare-error", error });
+            setMessageEditError({ messageId: edit.messageId, text: error });
+          } else {
+            updateMessageEdit({ ...edit, phase: "ready", agent: msg.agent, text: msg.text,
+              attachments: msg.attachments ?? [], missingAttachments: msg.missingAttachments ?? [], error: undefined });
+            requestAnimationFrame(() => composerRef.current?.focus());
+          }
+          break;
+        }
+        case "editMessageResult": {
+          const edit = messageEditRef.current;
+          if (!edit || edit.phase !== "saving" || edit.saveRequestId !== msg.requestId ||
+              edit.sourceRecordId !== msg.sourceRecordId || edit.path !== p) break;
+          const binding = bindingRef.current;
+          if (binding.projectPath !== edit.path || pendingProjectRef.current || pendingSessionRef.current || pendingAgentRef.current) break;
+          if (binding.recordId !== edit.sourceRecordId && binding.recordId !== msg.recordId) {
+            // The tentative rebind belonged to a different session, not this fork.
+            updateMessageEdit(null);
+            break;
+          }
+          if (!msg.ok) {
+            updateMessageEdit({ ...edit, phase: "ready", saveRequestId: undefined,
+              error: msg.error || "Не удалось сохранить изменения. Попробуйте ещё раз." });
+          } else if (msg.recordId) {
+            updateMessageEdit(null);
+            filePickerTargetRef.current = null;
+            // Fallback for a result arriving before the binding/hydration broadcast.
+            if (binding.recordId !== msg.recordId) {
+              replaceBinding(edit.path, msg.recordId);
+              updateTaskSnapshot(null);
+              post({ type: "ready" });
+            }
+            setAgentReady(true);
+            requestAnimationFrame(() => composerRef.current?.focus());
+          }
+          break;
+        }
         case "attachmentAdded": {
-          // В ленту того проекта, чья папка приняла файл, а не «текущую».
           const target = msg.path ?? activeRef.current;
+          const context = msg.draftContext;
+          if (context) {
+            const edit = messageEditRef.current;
+            if (edit && context.draftId === edit.draftId) {
+              if (edit.phase !== "ready" || context.recordId !== edit.sourceRecordId ||
+                  target !== edit.path || !editMatchesSource(edit)) break;
+              updateMessageEdit({ ...edit, attachments: [...edit.attachments,
+                ...msg.files.filter((file) => !edit.attachments.some((existing) => existing.path === file.path))],
+                missingAttachments: edit.missingAttachments.filter((name) => !msg.files.some((file) => file.name === name)),
+                pendingUploads: edit.pendingUploads.filter((uploadId) => uploadId !== context.uploadId) });
+              break;
+            }
+            if (context.draftId !== normalAttachmentDraftRef.current || target !== activeRef.current ||
+                context.recordId !== bindingRef.current.recordId) break;
+          } else if (messageEditRef.current || target !== activeRef.current) break;
           setPendingBy((prev) => {
             const cur = prev[target] ?? [];
             return {
@@ -768,6 +925,8 @@ function ChatTile({
           break;
         }
         case "userMessage":
+          if (msg.recordId && p === bindingRef.current.projectPath &&
+              msg.recordId !== bindingRef.current.recordId) break;
           finalizeStreaming(p);
           mutateItems(p, (x) => [
             ...x,
@@ -777,6 +936,7 @@ function ChatTile({
               text: msg.text,
               ts: Date.now(),
               ...(msg.attachments?.length ? { attachments: msg.attachments } : {}),
+              ...(msg.sentMessage ? { sentMessage: msg.sentMessage } : {}),
             },
           ]);
           break;
@@ -811,10 +971,26 @@ function ChatTile({
         case "info":
           mutateItems(p, (x) => [...x, { id: nextId++, role: "info", text: msg.text }]);
           break;
-        case "error":
+        case "error": {
+          const context = msg.draftContext;
+          if (context) {
+            const edit = messageEditRef.current;
+            if (edit && context.draftId === edit.draftId) {
+              if (edit.phase !== "ready" || context.recordId !== edit.sourceRecordId ||
+                  p !== edit.path || !editMatchesSource(edit) ||
+                  (context.uploadId && !edit.pendingUploads.includes(context.uploadId))) break;
+              updateMessageEdit({ ...edit,
+                pendingUploads: edit.pendingUploads.filter((uploadId) => uploadId !== context.uploadId),
+                error: msg.message });
+              break;
+            }
+            if (context.draftId !== normalAttachmentDraftRef.current || p !== activeRef.current ||
+                context.recordId !== bindingRef.current.recordId) break;
+          }
           finalizeStreaming(p);
           mutateItems(p, (x) => [...x, { id: nextId++, role: "error", text: msg.message }]);
           break;
+        }
         case "reset":
           mutateItems(p, () => []);
           setQueueBy((prev) => ({ ...prev, [p]: [] }));
@@ -850,7 +1026,8 @@ function ChatTile({
     window.addEventListener("message", onMessage);
     post({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
-  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest, updateTaskSnapshot, post, chatId]);
+  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest,
+    updateTaskSnapshot, post, chatId, replaceBinding, updateMessageEdit, editMatchesSource]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
   // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
@@ -860,9 +1037,9 @@ function ChatTile({
       if (prevItemsRef.current[path] !== projItems) {
         const binding = bindingRef.current;
         const recordId = itemRecordsRef.current.get(projItems);
+        if (!recordId || (path === binding.projectPath && recordId !== binding.recordId)) continue;
         if (chatId && (path !== binding.projectPath || !recordId || recordId !== binding.recordId)) continue;
-        post({ type: "saveTranscript", path, items: projItems,
-          ...(chatId ? { recordId } : {}) });
+        post({ type: "saveTranscript", path, items: projItems, recordId });
       }
     }
     prevItemsRef.current = itemsByProject;
@@ -948,7 +1125,7 @@ function ChatTile({
     ta.style.height = "auto";
     const max = Math.max(120, Math.floor(window.innerHeight * 0.5));
     ta.style.height = `${Math.min(ta.scrollHeight + 2, max)}px`;
-  }, [draft, composerHeight, composerExpanded, activePath]);
+  }, [composerDraft, composerHeight, composerExpanded, activePath]);
 
   useEffect(() => {
     try {
@@ -983,7 +1160,41 @@ function ChatTile({
     window.addEventListener("pointerup", onUp);
   };
 
+  const requestMessageEdit = (edit: MessageEditDraft) => {
+    const requestId = draftId();
+    const preparing = { ...edit, prepareRequestId: requestId, phase: "preparing" as const, error: undefined };
+    updateMessageEdit(preparing);
+    setMessageEditError(null);
+    post({ type: "prepareMessageEdit", requestId, recordId: edit.sourceRecordId,
+      messageId: edit.messageId, path: edit.path });
+  };
+
+  const beginMessageEdit = (item: Extract<ChatItem, { role: "user" | "assistant" }>, trigger: HTMLButtonElement) => {
+    const sent = item.sentMessage;
+    const binding = bindingRef.current;
+    if (!sent || sent.editUnavailableReason || !binding.recordId || busy || !agentReady || agentSwitching ||
+        pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current || messageEditRef.current) return;
+    editTriggerRef.current = trigger;
+    const identity = taskSnapshotRef.current?.identity;
+    requestMessageEdit({ draftId: draftId(), prepareRequestId: "", path: activePath,
+      sourceRecordId: binding.recordId,
+      ...(identity?.recordId === binding.recordId ? { sourceCreatedAt: identity.createdAt } : {}),
+      messageId: sent.messageId, agent: sent.agent, text: "", attachments: [], missingAttachments: [],
+      pendingUploads: [], phase: "preparing" });
+  };
+
   const send = () => {
+    const edit = messageEditRef.current;
+    if (edit) {
+      if (edit.phase !== "ready" || !editMatchesSource(edit) || busyRef.current[edit.path] || !agentReady ||
+          pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current ||
+          edit.missingAttachments.length || edit.pendingUploads.length || (!edit.text.trim() && !edit.attachments.length)) return;
+      const requestId = draftId();
+      updateMessageEdit({ ...edit, phase: "saving", saveRequestId: requestId, error: undefined });
+      post({ type: "editMessage", requestId, recordId: edit.sourceRecordId, messageId: edit.messageId,
+        text: edit.text, attachments: edit.attachments, path: edit.path });
+      return;
+    }
     if (pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current || !agentReady) return;
     const text = draft.trim();
     if (!text && pending.length === 0) return;
@@ -991,6 +1202,7 @@ function ChatTile({
     const attachments = pending;
     const path = activePath;
     setDraft("");
+    normalAttachmentDraftRef.current = draftId();
     setPendingBy((prev) => ({ ...prev, [path]: [] }));
     if (busyBy[path] && sendMode !== "later") {
       // Корректировка на лету: сообщение уходит в идущий ход.
@@ -1009,26 +1221,66 @@ function ChatTile({
   };
 
   /** Вставка/перетаскивание файлов: байты уходят хосту, он сохраняет в проект. */
-  const ingestFiles = (files: FileList | File[]) => {
-    if (pendingProjectRef.current) return;
+  const captureAttachmentTarget = (): AttachmentTarget | null => {
+    if (pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current || !agentReady) return null;
+    const edit = messageEditRef.current;
+    if (edit) {
+      if (edit.phase !== "ready" || busyRef.current[edit.path] || !editMatchesSource(edit)) return null;
+      return { path: edit.path, context: { draftId: edit.draftId, recordId: edit.sourceRecordId }, editing: true };
+    }
+    const binding = bindingRef.current;
+    if (!binding.recordId) return null;
+    return { path: binding.projectPath,
+      context: { draftId: normalAttachmentDraftRef.current, recordId: binding.recordId }, editing: false };
+  };
+
+  const attachmentTargetCurrent = (target: AttachmentTarget) => {
+    const binding = bindingRef.current;
+    if (binding.projectPath !== target.path || binding.recordId !== target.context.recordId ||
+        pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current) return false;
+    if (!target.editing) return target.context.draftId === normalAttachmentDraftRef.current;
+    const edit = messageEditRef.current;
+    return !!edit && edit.phase === "ready" && edit.draftId === target.context.draftId && editMatchesSource(edit);
+  };
+
+  const ingestFiles = (files: FileList | File[], capturedTarget = captureAttachmentTarget()) => {
+    if (!capturedTarget || !attachmentTargetCurrent(capturedTarget)) return;
+    const target = capturedTarget;
     for (const file of Array.from(files)) {
       if (file.size > 20 * 1024 * 1024) {
-        mutateItems(activePath, (p) => [
+        const error = `«${file.name}» больше 20 МБ — прикрепите через 📎.`;
+        const edit = messageEditRef.current;
+        if (target.editing && edit) updateMessageEdit({ ...edit, error });
+        else mutateItems(target.path, (p) => [
           ...p,
-          { id: nextId++, role: "error", text: `«${file.name}» больше 20 МБ — прикрепите через 📎.` },
+          { id: nextId++, role: "error", text: error },
         ]);
         continue;
       }
+      const name = file.name || "screenshot.png";
+      const uploadId = draftId();
+      const uploadTarget = { ...target, context: { ...target.context, uploadId } };
+      const edit = messageEditRef.current;
+      if (target.editing && edit) updateMessageEdit({ ...edit, pendingUploads: [...edit.pendingUploads, uploadId] });
       const reader = new FileReader();
       reader.onload = () => {
+        if (!attachmentTargetCurrent(uploadTarget)) return;
         const dataUrl = reader.result as string;
         const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
         post({
           type: "saveAttachment",
-          name: file.name || "screenshot.png",
+          name,
           dataBase64: base64,
-          path: activePath,
+          path: target.path,
+          draftContext: uploadTarget.context,
         });
+      };
+      reader.onerror = () => {
+        const current = messageEditRef.current;
+        if (target.editing && current && attachmentTargetCurrent(uploadTarget) && current.pendingUploads.includes(uploadId)) {
+          updateMessageEdit({ ...current, pendingUploads: current.pendingUploads.filter((value) => value !== uploadId),
+            error: `Не удалось прочитать «${name}». Прикрепите файл ещё раз.` });
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -1044,6 +1296,7 @@ function ChatTile({
       return;
     }
     if (value === activeRef.current) return;
+    cancelMessageEdit(false);
     clearServerTest();
     updateTaskSnapshot(null);
     pendingAgentRef.current = null;
@@ -1053,7 +1306,7 @@ function ChatTile({
       pendingProjectRef.current = value;
       setProjectSwitching(true);
     } else {
-      bindingRef.current = { projectPath: value, recordId: undefined };
+      replaceBinding(value, undefined);
       setAgentReady(false);
     }
     activeRef.current = value;
@@ -1127,7 +1380,7 @@ function ChatTile({
       disabled={!agentReady || agentSwitching}
       onSave={post}
       onInsert={fields => {
-        setDraft(previous => appendTaskCheckpoint(previous, fields));
+        updateComposerDraft(appendTaskCheckpoint(composerDraft, fields));
         setSlashDismissed(true);
         composerRef.current?.focus();
       }}
@@ -1760,6 +2013,7 @@ function ChatTile({
           value={agentReady ? agent : ""}
           onChange={(e) => {
             const nextAgent = e.target.value as AgentId;
+            cancelMessageEdit(false);
             pendingAgentRef.current = nextAgent;
             setAgentSwitching(true);
             setAgent(nextAgent);
@@ -1777,6 +2031,7 @@ function ChatTile({
           title="Новая сессия (текущая непустая сохранится в истории 🕘)"
           disabled={busy || agentSwitching || !agentReady}
           onClick={() => {
+            cancelMessageEdit(false);
             const requestId = `session-${Date.now()}-${nextId++}`;
             pendingSessionRef.current = requestId;
             pendingAgentRef.current = null;
@@ -1998,16 +2253,37 @@ function ChatTile({
             );
           }
           switch (it.role) {
-            case "user":
+            case "user": {
+              const editReason = it.sentMessage?.editUnavailableReason ||
+                (!it.sentMessage ? "Для этого сообщения нет сохранённой точки редактирования." :
+                  editBlocked ? "Дождитесь завершения работы или переключения чата." :
+                    messageEdit ? "Завершите текущее редактирование." : undefined);
               return (
                 <div key={it.id} className="msg user">
                   {it.text}
                   {it.attachments && it.attachments.length > 0 && (
                     <div className="msg-attachments">📎 {it.attachments.join(", ")}</div>
                   )}
-                  {it.ts && <div className="msg-time">{formatStamp(it.ts)}</div>}
+                  <div className="msg-footer">
+                    {it.ts && <span className="msg-time">{formatStamp(it.ts)}</span>}
+                    <button
+                      type="button"
+                      className="msg-edit"
+                      aria-label="Редактировать сообщение"
+                      title={editReason || "Редактировать сообщение"}
+                      disabled={!!editReason}
+                      onClick={(event) => beginMessageEdit(it, event.currentTarget)}
+                    >
+                      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+                        <path d="m10.8 2.4 2.8 2.8M2.5 13.5l3.4-.7 7.7-7.7a1.2 1.2 0 0 0 0-1.7l-1-1a1.2 1.2 0 0 0-1.7 0l-7.7 7.7-.7 3.4Z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                  </div>
+                  {messageEditError && messageEditError.messageId === it.sentMessage?.messageId &&
+                    <div className="message-edit-inline-error" role="alert">{messageEditError.text}</div>}
                 </div>
               );
+            }
             case "assistant":
               return (
                 <div key={it.id} className="msg assistant md">
@@ -2127,6 +2403,13 @@ function ChatTile({
           e.preventDefault();
           if (e.dataTransfer.files.length) ingestFiles(e.dataTransfer.files);
         }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && messageEditRef.current && messageEditRef.current.phase !== "saving") {
+            event.preventDefault();
+            event.stopPropagation();
+            cancelMessageEdit();
+          }
+        }}
       >
         <div
           className="composer-resizer"
@@ -2137,7 +2420,39 @@ function ChatTile({
             setComposerExpanded(false);
           }}
         />
-        {queue.length > 0 && (
+        {messageEdit && (
+          <div className="message-edit-banner">
+            <strong>Редактирование отправленного сообщения</strong>
+            <span id={editHintId}>
+              {messageEdit.phase === "preparing" ? "Загружаю исходное сообщение и вложения…" :
+                messageEdit.phase === "saving" ? "Сохраняю новую ветку…" :
+                  "Сохранение начнёт новую ветку. Оригинал останется в истории."}
+            </span>
+            {messageEdit.phase === "preparing" || messageEdit.phase === "saving"
+              ? <span className="visually-hidden" role="status">{messageEdit.phase === "preparing" ? "Загрузка сообщения" : "Сохранение сообщения"}</span>
+              : null}
+          </div>
+        )}
+        {messageEdit?.error && <div className="message-edit-error" id={editErrorId} role="alert">{messageEdit.error}</div>}
+        {messageEdit?.missingAttachments.length ? (
+          <div className="attach-row" aria-label="Недоступные вложения">
+            {messageEdit.missingAttachments.map((name, index) => (
+              <span key={`${name}-${index}`} className="attach-chip missing-attachment" title="Прикрепите файл заново или уберите его перед сохранением">
+                ⚠ {name} · недоступен
+                <button type="button" className="attach-remove" aria-label={`Убрать недоступное вложение ${name}`}
+                  title="Убрать недоступное вложение" disabled={editFormDisabled}
+                  onClick={() => {
+                    const edit = messageEditRef.current;
+                    if (edit?.phase === "ready") updateMessageEdit({ ...edit,
+                      missingAttachments: edit.missingAttachments.filter((_, position) => position !== index) });
+                  }}>✕</button>
+              </span>
+            ))}
+            <span className="message-edit-missing-hint">Прикрепите эти файлы заново или уберите их перед сохранением.</span>
+          </div>
+        ) : null}
+        {!!messageEdit?.pendingUploads.length && <div role="status">Добавляю вложения…</div>}
+        {queue.length > 0 && !messageEdit && (
           <div className="attach-row">
             {queue.map((q, i) => (
               <span key={i} className="attach-chip queue-chip" title={q.text}>
@@ -2187,6 +2502,8 @@ function ChatTile({
                 <button
                   className="attach-remove"
                   title="Убрать вложение"
+                  aria-label={`Убрать вложение ${a.name}`}
+                  disabled={editFormDisabled}
                   onClick={() => setPending((p) => p.filter((x) => x.path !== a.path))}
                 >
                   ✕
@@ -2211,17 +2528,21 @@ function ChatTile({
             ))}
           </div>
         )}
-        {slashMatch && !slashDismissed && slashList.length === 0 && agent === "codex" && (
+        {slashMatch && !messageEdit && !slashDismissed && slashList.length === 0 && agent === "codex" && (
           <div className="slash-menu slash-empty">
             У Codex команды — это файлы *.md в ~/.codex/prompts: имя файла станет командой.
           </div>
         )}
         <textarea
           ref={composerRef}
-          value={draft}
+          value={composerDraft}
+          aria-label={messageEdit ? "Редактируемое сообщение" : "Сообщение агенту"}
+          aria-describedby={messageEdit ? `${editHintId}${messageEdit.error ? ` ${editErrorId}` : ""}` : undefined}
+          aria-invalid={!!messageEdit?.error}
+          readOnly={editFormDisabled}
           placeholder="Сообщение агенту… (Enter — отправить, «/» — команды CLI, Cmd+V — вставить скриншот, файлы можно перетащить)"
           onChange={(e) => {
-            setDraft(e.target.value);
+            updateComposerDraft(e.target.value);
             setSlashDismissed(false);
             setSlashIdx(0);
           }}
@@ -2268,25 +2589,31 @@ function ChatTile({
               multiple
               hidden
               onChange={(e) => {
-                if (e.target.files?.length) ingestFiles(e.target.files);
+                const target = filePickerTargetRef.current;
+                filePickerTargetRef.current = null;
+                if (e.target.files?.length && target) ingestFiles(e.target.files, target);
                 e.target.value = "";
               }}
             />
             <button
               className="attach-btn"
+              aria-label="Прикрепить файлы"
               title="Прикрепить файлы (или вставьте скриншот из буфера, или перетащите сюда)"
-              disabled={busy}
-              onClick={() =>
-                REMOTE
-                  ? fileInputRef.current?.click()
-                  : post({ type: "pickAttachment", path: activePath })
-              }
+              disabled={busy || editFormDisabled || !agentReady || agentSwitching}
+              onClick={() => {
+                const target = captureAttachmentTarget();
+                if (!target) return;
+                if (REMOTE) {
+                  filePickerTargetRef.current = target;
+                  fileInputRef.current?.click();
+                } else post({ type: "pickAttachment", path: target.path, draftContext: target.context });
+              }}
             >
               📎
             </button>
             <button
               className="attach-btn"
-              hidden={REMOTE}
+              hidden={REMOTE || !!messageEdit}
               title="Не отправлять агенту, а сохранить доступы из сообщения в переменные окружения выбранных проектов. Формат — по строке на переменную: SSH_PASSWORD=секрет"
               disabled={!draft.trim()}
               onClick={() =>
@@ -2310,7 +2637,7 @@ function ChatTile({
             >
               {composerExpanded ? "⤡" : "⤢"}
             </button>
-            <div className="mode-seg" role="radiogroup" aria-label="Режим отправки во время хода">
+            {!messageEdit && <div className="mode-seg" role="radiogroup" aria-label="Режим отправки во время хода">
               {(
                 [
                   ["now", "⚡ сразу", "Сразу: прервать текущий шаг агента и учесть сообщение немедленно"],
@@ -2329,9 +2656,24 @@ function ChatTile({
                   {label}
                 </button>
               ))}
-            </div>
+            </div>}
           </div>
-          {busy ? (
+          {messageEdit ? (
+            <div className="message-edit-actions">
+              <button type="button" className="cancel-edit" title="Отменить редактирование (Esc)"
+                disabled={messageEdit.phase === "saving"} onClick={() => cancelMessageEdit()}>Отмена</button>
+              {messageEdit.phase === "prepare-error" ? (
+                <button type="button" className="send" disabled={editBlocked}
+                  onClick={() => requestMessageEdit(messageEdit)}>Загрузить снова</button>
+              ) : (
+                <button type="button" className="send" onClick={send}
+                  disabled={editBlocked || editFormDisabled || !!messageEdit.missingAttachments.length ||
+                    !!messageEdit.pendingUploads.length || (!composerDraft.trim() && !pending.length)}>
+                  {messageEdit.phase === "saving" ? "Сохраняю…" : "Сохранить и отправить"}
+                </button>
+              )}
+            </div>
+          ) : busy ? (
             <>
               <button
                 className="send"
@@ -2395,6 +2737,7 @@ function ChatTile({
                       scope: it.value === "base" ? "base" : "chat",
                     });
                   } else {
+                    if (choice.kind === "session") cancelMessageEdit(false);
                     post({ type: "choose", kind: choice.kind, agent: choice.agent, value: it.value });
                   }
                   setChoice(null);
