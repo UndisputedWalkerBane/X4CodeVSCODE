@@ -80,8 +80,9 @@ test("Claude refuses fork boundaries ignored by the provider",async()=>{
 });
 test("Claude cancellation prevents late provider append after prepare returns",async()=>{
  const h=await fixture("abort");const ctrl=new AbortController();h.opts.signal=ctrl.signal;let captured;
- h.fork=async(_id,o)=>{captured=o;return new Promise(()=>{});};const p=new ClaudeBackend().prepareEdit(h.opts);
- for(let i=0;i<100&&!captured;i++)await new Promise(r=>setImmediate(r));assert.ok(captured);ctrl.abort();await assert.rejects(p,/abort|отмен/iu);
+ let entered;const forkEntered=new Promise(resolve=>{entered=resolve;});
+ h.fork=async(_id,o)=>{captured=o;entered();return new Promise(()=>{});};const p=new ClaudeBackend().prepareEdit(h.opts);
+ await Promise.race([forkEntered,p.then(()=>assert.fail("preparation completed before cancellation"))]);assert.ok(captured);ctrl.abort();await assert.rejects(p,/abort|отмен/iu);
  await assert.rejects(captured.sessionStore.append({sessionId:forkId},[]),/abort|отмен/iu);
 });
 test("Claude rejects a transcript whose cwd differs from the active project",async()=>{

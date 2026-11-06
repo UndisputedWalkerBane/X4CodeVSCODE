@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { promises as fsPromises } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 import { build } from "esbuild";
@@ -502,7 +502,7 @@ test("contextual upload rejects an old record and successful upload includes exa
   const h = await editSetup(), draftContext = { draftId: "edit-upload-1", recordId: "record-1", uploadId: "upload-one" };
   await h.send({ type: "saveAttachment", chatId: h.slots[0].chatId, path: h.projects[0].id, draftContext, name: "résumé 📌.txt", dataBase64: Buffer.from("draft file").toString("base64") });
   const added = h.messages.filter(m => m.type === "attachmentAdded").at(-1); assert.deepEqual(added.draftContext, draftContext); assert.equal(added.files[0].name, "résumé 📌.txt"); assert.equal(await readFile(added.files[0].path, "utf8"), "draft file");
-  assert.equal(added.files[0].path.startsWith(join(h.projects[0].path, ".agent-hub", "attachments") + "/"), true);
+  assert.equal(dirname(added.files[0].path), join(h.projects[0].path, ".agent-hub", "attachments"));
   h.messages.length = 0; await h.send({ type: "newSession", chatId: h.slots[0].chatId });
   await h.send({ type: "saveAttachment", chatId: h.slots[0].chatId, path: h.projects[0].id, draftContext, name: "stale.txt", dataBase64: "eA==" });
   assert.equal(h.messages.some(m => m.type === "attachmentAdded"), false);
