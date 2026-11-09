@@ -8,10 +8,43 @@ type Json = Record<string, unknown>;
 const EDIT_TIMEOUT_MS = 60_000;
 const unavailable = () => new Error("Не удалось однозначно найти исходный промпт в нативной истории. Откройте новый чат или выберите сообщение с сохранённой привязкой провайдера.");
 
+const isJson = (value: unknown): value is Json => !!value && typeof value === "object" && !Array.isArray(value);
+const legacyMatches = (texts: (string | undefined)[], prompt: string | undefined): number[] =>
+  prompt ? texts.flatMap((text, index) => text?.endsWith(prompt) ? [index] : []) : [];
+
+/** A later userMessage is a steer, never the original boundary of its turn. */
+function firstUserText(turn: Json): string | undefined {
+  const user = (turn.items as unknown[]).find(item => isJson(item) && item.type === "userMessage");
+  if (!isJson(user) || !Array.isArray(user.content)) return undefined;
+  return user.content.filter((part): part is Json => isJson(part) && part.type === "text" && typeof part.text === "string").map(part => part.text).join("\n");
+}
+
+/** Fail closed when any user content could conceal the original prompt. */
+function originalAbsent(turns: Json[], prompt: string | undefined): boolean {
+  if (!prompt?.trim()) return false;
+  for (const turn of turns) {
+    if (!["completed", "interrupted", "failed"].includes(String(turn.status))) return false;
+    for (const item of turn.items as unknown[]) {
+      if (!isJson(item) || typeof item.type !== "string" || !item.type) return false;
+      if (item.type !== "userMessage") continue;
+      if (!Array.isArray(item.content) || !item.content.length) return false;
+      const texts: string[] = [];
+      for (const part of item.content) {
+        if (!isJson(part)) return false;
+        if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
+        else if (part.type === "image" && typeof part.url === "string" && part.url) continue;
+        else if (part.type === "localImage" && typeof part.path === "string" && part.path) continue;
+        else return false;
+      }
+      if (texts.some(text => text.includes(prompt)) || texts.join("\n").includes(prompt)) return false;
+    }
+  }
+  return true;
+}
+
 /** Only a unique exact suffix is allowed for chats saved before native IDs existed. */
 export function uniqueLegacyIndex(texts: (string | undefined)[], prompt: string | undefined): number {
-  if (!prompt) throw unavailable();
-  const matches = texts.flatMap((text, index) => text?.endsWith(prompt) ? [index] : []);
+  const matches = legacyMatches(texts, prompt);
   if (matches.length !== 1) throw unavailable();
   return matches[0];
 }
@@ -85,7 +118,7 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
     }
     const ids = new Set<string>();
     for (const turn of turns) {
-      if (typeof turn.id !== "string" || !turn.id || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
+      if (!isJson(turn) || typeof turn.id !== "string" || !turn.id || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
       ids.add(turn.id);
     }
     return turns;
@@ -94,13 +127,17 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
     await request("initialize", { clientInfo: { name: "agent-hub", title: "Agent Hub", version: "1.0.0" } });
     child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
     const source = await readTurns(opts.sessionId);
+    const matches = opts.anchor ? [] : legacyMatches(source.map(firstUserText), opts.legacyPrompt);
+    if (!opts.anchor && matches.length !== 1) {
+      if (!matches.length && opts.allowSavedContextFallback === true && originalAbsent(source, opts.legacyPrompt)) {
+        opts.signal.throwIfAborted();
+        return { contextFallback: true };
+      }
+      throw unavailable();
+    }
     const index = opts.anchor?.provider === "codex"
       ? source.findIndex((turn) => turn.id === (opts.anchor as { turnId: string }).turnId)
-      : uniqueLegacyIndex(source.map((turn) => {
-          const users = (turn.items as Json[]).filter((item) => item.type === "userMessage");
-          if (users.length !== 1 || !Array.isArray(users[0].content)) return undefined;
-          return (users[0].content as Json[]).filter((c) => c.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n");
-        }), opts.legacyPrompt);
+      : matches[0];
     if (index < 0) throw unavailable();
     if (index === 0) return {};
     const prefix = source.slice(0, index);

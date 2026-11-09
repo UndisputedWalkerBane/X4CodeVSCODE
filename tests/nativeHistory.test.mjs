@@ -111,3 +111,81 @@ test("Codex rejects same-source fork IDs and unknown anchors without replay",asy
  const h=codexHarness([turn("one"),turn("two")],{ignore:"source"});await assert.rejects(new CodexAppServerBackend().prepareEdit(opts()),/отдельн|обновит/iu);
  assert.equal(h.calls.some(r=>r.method==="turn/start"),false);
 });
+
+const missingOpts = (overrides = {}) => ({ ...opts(), anchor: undefined, legacyPrompt: "Missing original 📌", allowSavedContextFallback: true, ...overrides });
+const noNativeMutation = h => assert.equal(h.calls.some(r => ["thread/fork", "thread/resume", "thread/revert", "turn/start"].includes(r.method)), false);
+
+test("Codex missing original can explicitly return saved-context fallback without native mutation", async () => {
+ const source = [turn("one", "Earlier prompt"), turn("two", "Last persisted prompt")], before = structuredClone(source);
+ const h = codexHarness(source);
+ assert.deepEqual(await new CodexAppServerBackend().prepareEdit(missingOpts()), { contextFallback: true });
+ assert.ok(h.calls.filter(r => r.method === "thread/turns/list").every(r => r.params.itemsView === "full"));
+ noNativeMutation(h); assert.equal(h.stopped, 1); assert.deepEqual(source, before);
+});
+
+test("Codex missing-original fallback requires explicit opt-in and no anchor", async () => {
+ for (const extra of [{ allowSavedContextFallback: undefined }, { anchor: { provider: "codex", sessionId: "source", turnId: "absent" } }]) {
+  const h = codexHarness([turn("one")]);
+  await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts(extra)), /однознач|истори/iu); noNativeMutation(h);
+ }
+});
+
+test("Codex resolves only the first user message of a turn even when later steers exist", async () => {
+ const target = turn("two", "context\nOriginal exact"), steer = { type: "userMessage", content: [{ type: "text", text: "Later steer" }] };
+ target.items.push(steer);
+ const h = codexHarness([turn("one"), target, turn("three")]);
+ assert.deepEqual(await new CodexAppServerBackend().prepareEdit(missingOpts({ legacyPrompt: "Original exact" })), { resumeSessionId: "fork" });
+ assert.equal(h.calls.find(r => r.method === "thread/fork").params.lastTurnId, "one");
+});
+
+test("Codex never mistakes a later steer for the original prompt or an absent message", async () => {
+ for (const text of ["Missing original 📌", "prefix Missing original 📌 suffix"]) {
+  const target = turn("two", "Actual original"); target.items.push({ type: "userMessage", content: [{ type: "text", text }] });
+  const h = codexHarness([turn("one"), target]);
+  await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts()), /однознач|истори/iu); noNativeMutation(h);
+ }
+});
+
+test("Codex rejects duplicate original suffixes and substring-only matches instead of fallback", async () => {
+ for (const source of [[turn("one", "Missing original 📌"), turn("two", "context\nMissing original 📌")],
+  [turn("one", "Missing original 📌 is present but not an exact suffix")]]) {
+  const h = codexHarness(source);
+  await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts()), /однознач|истори/iu); noNativeMutation(h);
+ }
+});
+
+test("Codex proves missing-original absence across every full source page", async () => {
+ const h = codexHarness([]), write = h.child.stdin._write;
+ h.child.stdin._write = (chunk, e, cb) => {
+  const req = JSON.parse(chunk.toString()); if (req.method !== "thread/turns/list") return write(chunk, e, cb);
+  h.calls.push(req); cb(); assert.equal(req.params.itemsView, "full");
+  h.child.stdout.write(JSON.stringify({ id: req.id, result: req.params.cursor ? { data: [turn("two", "Missing original 📌 in later page")], nextCursor: null } : { data: [turn("one")], nextCursor: "next" } }) + "\n");
+ };
+ await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts()), /однознач|истори/iu);
+ assert.equal(h.calls.filter(r => r.method === "thread/turns/list").length, 2); noNativeMutation(h);
+});
+
+test("Codex missing-original fallback refuses malformed, unknown or partial source content", async () => {
+ for (const source of [[{ ...turn("one"), itemsView: "notLoaded" }], [{ ...turn("one"), items: [null] }],
+  [turn("one", undefined), { ...turn("two"), items: [{ type: "userMessage", content: [{ type: "text", text: null }] }] }],
+  [{ ...turn("one"), items: [{ type: "userMessage", content: [{ type: "unknown", text: "hidden" }] }] }]]) {
+  const h = codexHarness(source);
+  await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts())); noNativeMutation(h);
+ }
+});
+
+test("Codex missing-original fallback rejects a failed later page and abort without changing source", async () => {
+ for (const abort of [false, true]) {
+  const source = [turn("one")], before = structuredClone(source), h = codexHarness(source), write = h.child.stdin._write;
+  const ctrl = new AbortController();
+  h.child.stdin._write = (chunk, e, cb) => {
+   const req = JSON.parse(chunk.toString()); if (req.method !== "thread/turns/list") return write(chunk, e, cb);
+   h.calls.push(req); cb();
+   if (!req.params.cursor) h.child.stdout.write(JSON.stringify({ id: req.id, result: { data: source, nextCursor: "next" } }) + "\n");
+   else if (abort) ctrl.abort();
+   else h.child.stdout.write(JSON.stringify({ id: req.id, error: { code: -32000, message: "source read failed" } }) + "\n");
+  };
+  await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts({ signal: ctrl.signal })), abort ? /отмен|abort/iu : /source read failed/);
+  noNativeMutation(h); assert.deepEqual(source, before); assert.equal(h.stopped, 1);
+ }
+});

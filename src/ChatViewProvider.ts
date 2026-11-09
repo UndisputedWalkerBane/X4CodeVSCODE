@@ -2986,6 +2986,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ? this.codexExec : this.backends[agent];
   }
 
+  /** Only an unanchored final text prompt may reconstruct context from the host log. */
+  private canUseSavedEditContext(target: ReturnType<ChatViewProvider["messageEditTarget"]>): boolean {
+    const { canonical, message, index } = target;
+    const log = canonical.chatLog, cut = message.logCut;
+    if (message.agent !== "codex" || message.kind !== "prompt" || message.anchor !== undefined ||
+        message.providerInput !== undefined || message.seenBefore !== undefined || message.editUnavailableReason ||
+        !message.text.trim() || message.attachmentFiles.length || message.missingAttachmentNames?.length ||
+        index !== canonical.items.length - 1 || !Number.isSafeInteger(cut) || cut! < 0 || !Array.isArray(log) || cut !== log.length - 1) return false;
+    const selected = canonical.items[index] as { attachments?: unknown };
+    if (selected.attachments !== undefined && (!Array.isArray(selected.attachments) || selected.attachments.length)) return false;
+    const sameText = canonical.items.filter(value => value && typeof value === "object" &&
+      (value as { role?: string; text?: string }).role === "user" && (value as { text?: string }).text === message.text);
+    if (sameText.length !== 1) return false;
+    if (log.some(entry => !entry || !["codex", "claude"].includes(entry.agent) ||
+        !["user", "assistant"].includes(entry.role) || typeof entry.text !== "string")) return false;
+    const original = log[cut!];
+    return original.agent === message.agent && original.role === "user" && original.text === clipLog(message.text) &&
+      (cut === 0 || log.slice(0, cut).some(entry => entry.text.trim().length > 0));
+  }
+
   private async editMessage(msg: Extract<WebviewToHost, { type: "editMessage" }>, source: "vscode" | "remote", surface?: string) {
     const chatId = source === "vscode" && surface === "multi-panel" ? msg.chatId : undefined;
     let key = msg.path ?? this.getActiveProjectKey() ?? "";
@@ -3033,8 +3053,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!backend.prepareEdit) throw new Error("Этот транспорт не поддерживает нативное редактирование сообщений.");
       const serverEnv = buildServerEnvironment(await this.getSecretEnv(key), await this.context.secrets.get(this.passwordKey(key)));
       requireActive();
+      const allowSavedContextFallback = this.canUseSavedEditContext(target);
       const prepared = await backend.prepareEdit({ cwd: target.project.path, sessionId: target.record.agentIds[message.agent]!,
         anchor: message.anchor, legacyPrompt: message.anchor ? undefined : message.providerInput ?? message.text,
+        ...(allowSavedContextFallback ? { allowSavedContextFallback: true } : {}),
         signal: controller.signal, config: this.buildAgentConfig(message.agent, target.record.modelOverrides?.[message.agent], target.record.effortOverrides?.[message.agent]),
         extraEnv: serverEnv, cliPath: message.agent === "claude" ? this.resolveClaudeCli() : undefined });
       let turn: Promise<void> | undefined;
@@ -3043,6 +3065,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const current = this.messageEditTarget(msg, source, surface);
         if (current.project.path !== target.project.path || JSON.stringify([current.record.createdAt, current.record.agentIds, current.message, current.index, current.canonical.chatLog]) !== fingerprint ||
             writerKeys.some(writer => this.sessionWriters.get(writer) !== controller)) throw new Error("Исходный чат изменился во время подготовки. Откройте сообщение заново.");
+        if (prepared.contextFallback && (!allowSavedContextFallback || !this.canUseSavedEditContext(current) || prepared.resumeSessionId !== undefined)) {
+          throw new Error("Не удалось безопасно восстановить контекст из сохранённой переписки. Исходный чат сохранён.");
+        }
         for (const file of msg.attachments) {
           try { if (!fs.statSync(file.path).isFile()) throw new Error("not a file"); }
           catch { throw new Error(`Вложение «${file.name}» стало недоступно. Выберите файл заново.`); }
@@ -3093,6 +3118,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (preparations.get(runKey)?.controller === controller) preparations.delete(runKey);
           // Register the new branch's writer before another send can be admitted.
           requireActive();
+          if (prepared.contextFallback) this.postScoped(key, { type: "info", text: "Исходное сообщение отсутствует в истории Codex. Новая ветка продолжена из сохранённой переписки; она может быть сокращена, полный нативный контекст восстановить не удалось." }, chatId);
           turn = this.runTurn(msg.text, message.agent, msg.attachments.map(file => ({ name: file.name, path: file.path })), key, true, undefined, chatId, true);
         } catch (error) {
           if (!branchId) {

@@ -14,6 +14,8 @@ export interface PrepareEditOptions {
   sessionId: string;
   anchor?: NativePromptAnchor;
   legacyPrompt?: string;
+  /** Host-only opt-in for a final unsent prompt with a verified saved-log boundary. */
+  allowSavedContextFallback?: boolean;
   signal: AbortSignal;
   config: AgentRunConfig;
   extraEnv?: Record<string, string>;
@@ -21,8 +23,10 @@ export interface PrepareEditOptions {
 }
 
 export interface PreparedEdit {
-  /** Undefined means an empty prefix: start a fresh native session. */
+  /** Undefined means a fresh native session, using the host's retained conversation if available. */
   resumeSessionId?: string;
+  /** Original absent from complete native history; host must reconstruct its verified saved prefix. */
+  contextFallback?: boolean;
   /** Retained OLD provider turn/message IDs -> anchors in the fork. */
   remappedAnchors?: Record<string, NativePromptAnchor>;
 }

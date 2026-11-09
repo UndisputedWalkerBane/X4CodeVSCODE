@@ -114,6 +114,86 @@ test("successful edit retains source history and commits provider prefix before 
   const hydration = h.messages.findIndex(m => m.type === "transcript" && m.recordId === ack.recordId); const acknowledged = h.messages.findIndex(m => m === ack); assert.ok(hydration >= 0 && hydration < acknowledged);
 });
 
+const fallbackNotice = "Исходное сообщение отсутствует в истории Codex. Новая ветка продолжена из сохранённой переписки; она может быть сокращена, полный нативный контекст восстановить не удалось.";
+async function missingOriginalSetup() {
+  const h = await editSetup();
+  h.record().items.pop(); h.record().chatLog.pop();
+  delete h.record().sentMessages["selected-message"].anchor;
+  h.p.backends.codex.prepareEdit = async opts => { h.prepares.push(opts); return { contextFallback: true }; };
+  return h;
+}
+
+test("missing final original continues a fresh branch from saved prefix and announces the context limit before inference", async () => {
+  const h = await missingOriginalSetup(), source = structuredClone(h.record()), other = structuredClone(h.record("record-2"));
+  const attachment = { name: "replacement.txt", path: h.file };
+  h.p.backends.codex.start = async function* (prompt, opts) {
+    const ack = h.acks().at(-1); assert.equal(ack?.ok, true);
+    const notice = h.messages.findIndex(m => m.type === "info" && m.text === fallbackNotice);
+    const hydration = h.messages.findIndex(m => m.type === "transcript" && m.recordId === ack.recordId);
+    assert.ok(hydration >= 0 && hydration < h.messages.indexOf(ack) && h.messages.indexOf(ack) < notice);
+    assert.equal(h.messages[notice].chatId, h.slots[0].chatId);
+    assert.deepEqual(h.record(ack.recordId).chatSeen, {});
+    h.calls.push({ prompt, opts }); yield { kind: "assistantText", text: "Replacement reply" };
+  };
+  await h.send(h.edit({ attachments: [attachment], allowSavedContextFallback: false, contextFallback: false }));
+  const ack = h.acks().at(-1); assert.equal(ack?.ok, true); assert.equal(h.prepares[0].allowSavedContextFallback, true);
+  const branch = h.record(ack.recordId); assert.equal(branch.agentIds.codex, null); assert.equal(h.calls[0].opts.resumeSessionId, undefined);
+  assert.match(h.calls[0].prompt, /Earlier prompt/); assert.match(h.calls[0].prompt, /Earlier reply/);
+  assert.equal(h.calls[0].prompt.split("Replacement 📌").length - 1, 1); assert.equal(h.calls[0].prompt.includes("Original selected"), false);
+  assert.deepEqual(branch.chatLog.slice(0, 2), source.chatLog.slice(0, 2)); assert.deepEqual(h.calls[0].opts.attachments, [{ path: attachment.path, isImage: false }]);
+  assert.deepEqual(Object.values(branch.sentMessages).find(message => message.text === "Replacement 📌").attachmentFiles, [attachment]);
+  assert.deepEqual(h.record(), source); assert.deepEqual(h.record("record-2"), other);
+  assert.equal(h.p.findChatSlot(h.slots[1].chatId).recordId, "record-2"); assert.equal(branch.sentMessages["first-message"].anchor, undefined);
+});
+
+test("first missing original may start a fresh branch with an empty saved prefix", async () => {
+  const h = await missingOriginalSetup(), selected = h.record().sentMessages["selected-message"];
+  selected.logCut = 0; h.record().items = [h.record().items[2]]; h.record().chatLog = [h.record().chatLog[2]];
+  await h.send(h.edit()); assert.equal(h.acks().at(-1)?.ok, true); assert.equal(h.prepares[0].allowSavedContextFallback, true);
+  assert.equal(h.calls[0].prompt.includes("Earlier prompt"), false); assert.equal(h.calls[0].opts.resumeSessionId, undefined);
+});
+
+for (const invalid of ["later-assistant", "later-tool", "duplicate", "providerInput", "seenBefore", "anchor", "original-attachment", "missing-attachment", "wrong-log", "later-log", "invalid-cut", "unusable-prefix"]) {
+  test(`saved-context fallback is not authorized by renderer for ${invalid}`, async () => {
+    const h = await missingOriginalSetup(), selected = h.record().sentMessages["selected-message"];
+    if (invalid.startsWith("later-" ) && invalid !== "later-log") h.record().items.push({ role: invalid.slice(6), text: "Later item" });
+    if (invalid === "duplicate") h.record().items.unshift({ role: "user", text: selected.text });
+    if (invalid === "providerInput") selected.providerInput = selected.text;
+    if (invalid === "seenBefore") selected.seenBefore = 0;
+    if (invalid === "anchor") selected.anchor = { provider: "codex", sessionId: "native-source", turnId: "missing" };
+    if (invalid === "original-attachment") selected.attachmentFiles = [{ name: "original.txt", path: h.file }];
+    if (invalid === "missing-attachment") selected.missingAttachmentNames = ["gone.txt"];
+    if (invalid === "wrong-log") h.record().chatLog[2].text = "Another original";
+    if (invalid === "later-log") h.record().chatLog.push({ agent: "codex", role: "assistant", text: "Later reply" });
+    if (invalid === "invalid-cut") selected.logCut = 1.5;
+    if (invalid === "unusable-prefix") h.record().chatLog[0] = { agent: "codex", role: "tool", text: "Unknown saved entry" };
+    const before = structuredClone(h.record());
+    await h.send(h.edit({ allowSavedContextFallback: true, contextFallback: true }));
+    assert.equal(h.prepares[0]?.allowSavedContextFallback, undefined); assert.equal(h.acks().at(-1)?.ok, false);
+    assert.deepEqual(h.record(), before); assert.equal(h.p.findChatSlot(h.slots[0].chatId).recordId, "record-1"); assert.deepEqual(h.calls, []);
+    assert.equal(h.messages.some(m => m.type === "info" && m.text === fallbackNotice), false);
+  });
+}
+
+for (const later of [{ role: "assistant", text: "Later reply" }, { role: "tool", text: "Later tool" }, { role: "user", text: "Later prompt" }, null]) {
+  test(`saved-context eligibility is checked again after preparation when ${later?.role ?? "unknown"} item is appended without log changes`, async () => {
+    const h = await missingOriginalSetup(), entered = gate(), release = gate();
+    h.p.backends.codex.prepareEdit = async opts => { h.prepares.push(opts); entered.resolve(); await release.promise; return { contextFallback: true }; };
+    const editing = h.send(h.edit()); await entered.promise; h.record().items.push(later); const before = structuredClone(h.record()); release.resolve(); await editing;
+    assert.equal(h.prepares[0].allowSavedContextFallback, true); assert.equal(h.acks().at(-1)?.ok, false); assert.deepEqual(h.record(), before); assert.deepEqual(h.calls, []);
+  });
+}
+
+test("saved-context preparation failure and cancellation leave the original and unrelated tile untouched", async () => {
+  for (const abort of [false, true]) {
+    const h = await missingOriginalSetup(), before = structuredClone(h.record()), other = structuredClone(h.record("record-2")), entered = gate(), release = gate();
+    h.p.backends.codex.prepareEdit = async opts => { h.prepares.push(opts); entered.resolve(); await release.promise; if (!abort) throw new Error("source read failed"); return { contextFallback: true }; };
+    const editing = h.send(h.edit()); await entered.promise;
+    if (abort) await h.send({ type: "stop", path: h.projects[0].id, chatId: h.slots[0].chatId });
+    release.resolve(); await editing; assert.equal(h.acks().at(-1)?.ok, false); assert.deepEqual(h.record(), before); assert.deepEqual(h.record("record-2"), other); assert.deepEqual(h.calls, []);
+  }
+});
+
 test("new session during native preparation proceeds independently and invalidates edit", async () => {
   const h = await editSetup(), entered = gate(), release = gate();
   h.p.backends.codex.prepareEdit = async () => { entered.resolve(); await release.promise; return { resumeSessionId: "stale-prefix" }; };
