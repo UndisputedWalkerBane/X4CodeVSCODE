@@ -173,7 +173,7 @@ test("resumed turns refresh project context and pass canonical credentials to ba
   const p = provider();
   const project = { ...b, path: temp };
   p.getProjects = () => [a, project];
-  p.context.secrets.get = async () => "fresh-password";
+  p.context.secrets.get = async key => key.startsWith("agentHub.serverPassword:") ? "fresh-password" : undefined;
   p.getSecretEnv = async () => ({ SSHPASS: "obsolete", CUSTOM_TOKEN: "project-token" });
   p.runs = new Map(); p.steers = new Map(); p.steerTexts = new Map(); p.deferred = new Map();
   p.directoryRuns = new Map(); p.sessionWriters = new Map(); p.pendingPermissions = new Map();

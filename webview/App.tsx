@@ -24,6 +24,7 @@ import type {
 import { projectKey } from "../src/shared/projectIdentity";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
 import { TaskCheckpoint, type TaskSnapshot } from "./TaskCheckpoint";
+import { ProjectAccesses, type ProjectAccessSnapshot } from "./ProjectAccesses";
 import { appendTaskCheckpoint, isTaskIdentity } from "../src/shared/taskState";
 
 import {
@@ -49,6 +50,7 @@ const CHAT_COMMAND_TYPES = new Set([
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
   "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
+  "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess",
   "prepareMessageEdit", "editMessage",
 ]);
 const CHAT_EVENT_TYPES = new Set([
@@ -57,6 +59,7 @@ const CHAT_EVENT_TYPES = new Set([
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
   "agentInfo", "effortInfo", "taskState",
+  "projectAccesses",
   "messageEditPrepared", "editMessageResult",
 ]);
 
@@ -374,6 +377,9 @@ function ChatTile({
   };
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
+  const [projectAccessSnapshot, setProjectAccessSnapshot] = useState<ProjectAccessSnapshot | null>(null);
+  const projectAccessProjectRef = useRef<string | null>(null);
+  projectAccessProjectRef.current = settingsOpen && form?.project ? projectKey(form.project) : null;
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
   const [serverTest, setServerTest] = useState<ServerTestState>(idleServerTest);
   const serverTestRef = useRef(serverTest);
@@ -841,6 +847,9 @@ function ChatTile({
           setForm(msg.settings);
           setNewPassword(undefined);
           clearServerTest();
+          break;
+        case "projectAccesses":
+          if (!REMOTE && msg.projectPath === projectAccessProjectRef.current) setProjectAccessSnapshot(msg);
           break;
         case "serverTestResult":
           updateServerTest(finishServerTest(serverTestRef.current, msg, serverDraftRef.current));
@@ -1626,6 +1635,13 @@ function ChatTile({
                     хранилище и передаются агенту только переменными окружения — в чат
                     и промпт попадают лишь имена переменных.
                   </div>
+                  {!REMOTE && <ProjectAccesses
+                    key={JSON.stringify([chatId, projectKey(form.project)])}
+                    projectPath={projectKey(form.project)}
+                    chatId={chatId}
+                    snapshot={projectAccessSnapshot}
+                    onPost={post}
+                  />}
                   <label className="set-row">
                     <span>Заметки</span>
                     <input
