@@ -668,3 +668,29 @@ test("an unchanged native session resumes with other-provider updates without du
   await h.p.runTurn("Continue", "codex", [], h.projects[0].id, true, undefined, h.slots[0].chatId);
   assert.equal(h.calls[0].prompt.includes("Earlier prompt"), false); assert.equal(h.calls[0].prompt.includes("Discarded future"), true);
 });
+
+for (const nativePrefix of [true, false]) {
+  test(`editing after a late accepted answer ${nativePrefix ? "remaps native prefix acceptance" : "keeps full fresh-session history"}`, async () => {
+    const h = await editSetup();
+    const retained = [
+      { agent: "codex", role: "user", text: "Pending before late answer" },
+      { agent: "codex", role: "user", text: "Late accepted answer", acceptedSessionId: "native-source" },
+      { agent: "codex", role: "user", text: "Foreign native acceptance", acceptedSessionId: "foreign-session" },
+      { agent: "claude", role: "user", text: "Other provider acceptance", acceptedSessionId: "native-source" },
+    ];
+    h.record().chatLog.splice(2, 0, ...structuredClone(retained));
+    h.record().items.splice(2, 0, ...retained.map((entry, i) => ({ id: `late-prefix-${i}`, role: "user", text: entry.text })));
+    h.record().sentMessages["selected-message"].logCut = 6;
+    h.record().sentMessages["selected-message"].seenBefore = 2;
+    if (!nativePrefix) h.p.backends.codex.prepareEdit = async () => ({});
+    await h.send(h.edit());
+    assert.equal(h.acks().at(-1)?.ok, true);
+    const branch = h.record(h.acks().at(-1).recordId);
+    assert.equal(h.calls[0].prompt.includes("Late accepted answer"), !nativePrefix);
+    for (const entry of [retained[0], retained[2], retained[3]]) assert.equal(h.calls[0].prompt.includes(entry.text), true);
+    assert.equal(branch.chatLog[3].acceptedSessionId, nativePrefix ? "native-prefix" : "native-source");
+    assert.equal(branch.chatLog[4].acceptedSessionId, "foreign-session");
+    assert.equal(branch.chatLog[5].acceptedSessionId, "native-source");
+    assert.deepEqual(h.record().chatLog.slice(2, 6), retained);
+  });
+}

@@ -143,6 +143,8 @@ interface ChatLogEntry {
   agent: AgentId;
   role: "user" | "assistant";
   text: string;
+  /** A live channel acknowledged this particular user entry, independently of the common-log cursor. */
+  acceptedSessionId?: string;
 }
 
 /** Authoritative prompt identity. Renderer snapshots never supply these fields. */
@@ -248,10 +250,40 @@ function clipLog(text: string): string {
     : text;
 }
 
+/** Shared by prompt construction and its preview; legacy cursors cannot prove pending own messages. */
+function selectSavedContext(record: SessionRecord | null | undefined, agent: AgentId): {
+  entries: ChatLogEntry[]; seenIdx: number; fullHistory: boolean;
+} {
+  const log = record?.chatLog ?? [];
+  const sessionId = record?.agentIds[agent];
+  if (!sessionId) return { entries: log, seenIdx: 0, fullHistory: true };
+  const storedSeen = record?.chatSeen?.[agent];
+  const validSeen = typeof storedSeen === "number" && Number.isSafeInteger(storedSeen) && storedSeen >= 0 && storedSeen <= log.length;
+  const seenIdx = validSeen ? storedSeen : 0;
+  const carryOwnUsers = agent === "codex" && validSeen;
+  // A native anchor is stronger acceptance evidence than a stale common-log cursor.
+  const acceptedUserCuts = new Set<number>();
+  if (carryOwnUsers) {
+    for (const message of Object.values(record?.sentMessages ?? {})) {
+      const anchor = message.anchor;
+      const entry = message.logCut === undefined ? undefined : log[message.logCut];
+      const logText = message.attachmentFiles.length
+        ? `${message.text}\n\n${buildAttachmentsBlock(message.attachmentFiles)}` : message.text;
+      if (message.agent === "codex" && message.kind === "prompt" && message.logCut !== undefined &&
+          anchor?.provider === "codex" && anchor.sessionId === sessionId && typeof anchor.turnId === "string" && anchor.turnId.length > 0 &&
+          entry?.agent === message.agent && entry.role === "user" && entry.text === clipLog(logText)) {
+        acceptedUserCuts.add(message.logCut);
+      }
+    }
+  }
+  const entries = log.slice(seenIdx).filter((entry, offset) => entry.agent !== agent ||
+    (carryOwnUsers && entry.role === "user" && entry.acceptedSessionId !== sessionId && !acceptedUserCuts.has(seenIdx + offset)));
+  return { entries, seenIdx, fullHistory: false };
+}
+
 /**
- * Блок контекста для агента, не видевшего часть общей ленты: лента чата одна,
- * а CLI-сессии Claude и Codex раздельные — при переключении агенту передаём
- * текстом сообщения, которые обрабатывал другой агент.
+ * Сохранённая часть общей ленты для текущего промпта: сообщения другого агента
+ * и ответы пользователя Codex, оставшиеся после неподтверждённого подключения.
  */
 function buildCrossContext(entries: ChatLogEntry[], fullHistory = false): { block: string; count: number } | null {
   if (entries.length === 0) return null;
@@ -277,7 +309,7 @@ function buildCrossContext(entries: ChatLogEntry[], fullHistory = false): { bloc
   const block =
     `Контекст беседы: этот чат общий для двух агентов — Claude и Codex. ` +
     (fullHistory ? `Ниже — вся сохранённая история этой беседы до текущего сообщения:\n\n` :
-      `Ниже — сообщения этой же беседы, которые обрабатывал другой агент; ты их ещё не видел${note}:\n\n`) +
+      `Ниже — сохранённые сообщения этой беседы после последнего подтверждённого подключения${note}:\n\n`) +
     picked.join("\n\n---\n\n") +
     `\n\nЭто часть текущей беседы с пользователем: учитывай её и продолжай с места, где беседа остановилась.`;
   return { block, count: picked.length };
@@ -390,6 +422,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private steers = new Map<string, SteerChannel>();
   /** Тексты, докинутые в текущий ход, — для общего лога беседы. */
   private steerTexts = new Map<string, string[]>();
+  /** Verified native forks for ACK callbacks that can outlive their originating run. */
+  private acknowledgedSessionForks = new Map<string, string>();
   /** Запущенные ходы: логический ключ профиля → контроллер. */
   private runs = new Map<string, AbortController>();
   /** Shared cwd runs are permitted; overlap disables unsafe pull/auto-Git. */
@@ -661,17 +695,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
     }
 
-    const chatLog = record?.chatLog ?? [];
-    const seenIdx = Math.min(record?.chatSeen?.[agent] ?? 0, chatLog.length);
-    const unseen = chatLog.slice(seenIdx).filter((e) => e.agent !== agent);
-    const cross = buildCrossContext(unseen);
+    const savedContext = selectSavedContext(record, agent);
+    const cross = buildCrossContext(savedContext.entries, savedContext.fullHistory);
     parts.push(
       "",
-      "### Сообщения другого агента из этой ленты",
+      "### Сохранённые сообщения из этой ленты",
       "",
       cross
-        ? "Непросмотренных: " + String(cross.count) + ".\n\n" + "```\n" + cross.block + "\n```"
-        : "_Нет: агент видел всю ленту, либо второй агент в беседе не участвовал._",
+        ? "Добавится сообщений: " + String(cross.count) + ".\n\n" + "```\n" + cross.block + "\n```"
+        : "_Нет сохранённых сообщений для добавления к следующему промпту._",
     );
     if (sessionId && !cross) {
       parts.push(
@@ -3241,6 +3273,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         branch.agentIds[message.agent] = prepared.resumeSessionId ?? null;
         branch.preferredAgent = message.agent;
         branch.chatLog = structuredClone((current.canonical.chatLog ?? []).slice(0, logCut));
+        const sourceSessionId = current.record.agentIds[message.agent];
+        if (prepared.resumeSessionId && sourceSessionId) {
+          for (const entry of branch.chatLog) {
+            if (entry.agent === message.agent && entry.acceptedSessionId === sourceSessionId) entry.acceptedSessionId = prepared.resumeSessionId;
+          }
+        }
         const seenBefore = current.message.seenBefore;
         branch.chatSeen = prepared.resumeSessionId ? { [message.agent]: typeof seenBefore === "number" && Number.isSafeInteger(seenBefore) && seenBefore >= 0
           ? Math.min(seenBefore, logCut) : 0 } : {};
@@ -4664,6 +4702,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const slot = this.findChatSlot(msg.chatId);
         const target = slot?.projectPath ?? msg.path ?? this.getActiveProjectKey();
         const runKey = msg.chatId ?? target ?? "";
+        const runController = this.runs.get(runKey);
         const channel = target ? this.steers.get(runKey) : undefined;
         if (!target || !this.runs.has(runKey) || !channel?.handler) {
           // Ход уже закончился или агент не принимает сообщения на лету — обычная отправка.
@@ -4675,6 +4714,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const files = await this.relocateAttachments(project.path, msg.attachments ?? [], target);
         const text = files.length > 0 ? `${buildAttachmentsBlock(files)}\n\n${msg.text}` : msg.text;
         const record = slot ? this.getProjectStore(target).sessions.find(entry => entry.id === slot.recordId) : this.getActiveRecord(target);
+        const recordGen = record?.createdAt;
+        const acceptedSessionId = record?.agentIds[msg.agent];
         const sentMessage = record ? await this.recordSentMessage(target, record.id, record.createdAt, msg.text, msg.agent, "steer", files) : undefined;
         this.postScoped(target, {
           type: "userMessage", text: msg.text, recordId: record?.id, sentMessage,
@@ -4682,9 +4723,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }, msg.chatId);
         try {
           await channel.handler(text, msg.mode);
-          const list = this.steerTexts.get(runKey) ?? [];
-          list.push(text);
-          this.steerTexts.set(runKey, list);
+          if (this.runs.get(runKey) === runController && this.steers.get(runKey) === channel) {
+            const list = this.steerTexts.get(runKey) ?? [];
+            list.push(text);
+            this.steerTexts.set(runKey, list);
+          } else if (record) {
+            // The original run can finish while transport acknowledgement is pending.
+            await this.mutateRecord(target, record.id, r => {
+              if (r.createdAt !== recordGen) return;
+              const acceptedBy = this.acceptedSessionFor(target, record.id, r.createdAt, msg.agent, acceptedSessionId);
+              (r.chatLog ??= []).push({ agent: msg.agent, role: "user", text: clipLog(text),
+                ...(acceptedBy ? { acceptedSessionId: acceptedBy } : {}) });
+            });
+          }
           this.postScoped(target, {
             type: "info",
             text:
@@ -4973,6 +5024,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     return out;
+  }
+
+  private acceptedSessionFor(projectPath: string, recordId: string, createdAt: number, agent: AgentId, sessionId: string | null | undefined): string | undefined {
+    if (!sessionId) return undefined;
+    const visited = new Set<string>();
+    while (!visited.has(sessionId)) {
+      visited.add(sessionId);
+      const fork = this.acknowledgedSessionForks?.get(JSON.stringify([projectPath, recordId, createdAt, agent, sessionId]));
+      if (!fork) break;
+      sessionId = fork;
+    }
+    return sessionId;
   }
 
   private isQuestionOriginCurrent(cwd: string, agent: AgentId, origin: QuestionOrigin): boolean {
@@ -5380,17 +5443,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const sessions = record.agentIds;
 
-    // Контекст между агентами: лента чата общая, а CLI-сессии раздельные.
-    // Сообщения, обработанные другим агентом, этот агент не видел — подкладываем
-    // их в промпт. Slash-команды пропускаем: их промпт обязан начинаться с «/».
-    const chatLog = record.chatLog ?? [];
-    const seenIdx = Math.min(record.chatSeen?.[agent] ?? 0, chatLog.length);
-    const unseen = sessions[agent] ? chatLog.slice(seenIdx).filter((e) => e.agent !== agent) : chatLog;
-    const crossContext = isSlashCommand ? null : buildCrossContext(unseen, !sessions[agent]);
+    // Общая лента дополняет отдельную CLI-сессию, включая ответы Codex после
+    // неудавшегося подключения. Slash-команды обязаны начинаться с «/».
+    const savedContext = selectSavedContext(record, agent);
+    const seenIdx = savedContext.seenIdx;
+    const crossContext = isSlashCommand ? null : buildCrossContext(savedContext.entries, savedContext.fullHistory);
     if (crossContext) {
       emit({
         type: "info",
-        text: `В контекст добавлены сообщения другого агента из этой ленты: ${crossContext.count}.`,
+        text: `В контекст добавлены сохранённые сообщения из ленты: ${crossContext.count}.`,
       });
     }
 
@@ -5518,8 +5579,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             await mutateTurnRecord((r) => {
               r.agentIds[agent] = ev.sessionId;
               if (agent === "codex" && ev.forkedFromSessionId) {
+                (this.acknowledgedSessionForks ??= new Map()).set(
+                  JSON.stringify([cwd, record.id, recordGen, agent, ev.forkedFromSessionId]), ev.sessionId);
                 for (const message of Object.values(r.sentMessages ?? {})) {
                   if (message.anchor?.provider === "codex" && message.anchor.sessionId === ev.forkedFromSessionId) message.anchor.sessionId = ev.sessionId;
+                }
+                for (const entry of r.chatLog ?? []) {
+                  if (entry.acceptedSessionId === ev.forkedFromSessionId) entry.acceptedSessionId = ev.sessionId;
                 }
               }
             });
@@ -5612,7 +5678,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Пишем только в исходную запись, не в общий steerTexts map.
                     await turnLogDone;
                     await mutateTurnRecord((r) => {
-                      (r.chatLog ??= []).push({ agent, role: "user", text: clipLog(text) });
+                      const acceptedBy = this.acceptedSessionFor(cwd, record.id, recordGen, agent, origin.sessionId);
+                      (r.chatLog ??= []).push({ agent, role: "user", text: clipLog(text),
+                        ...(acceptedBy ? { acceptedSessionId: acceptedBy } : {}) });
                     });
                   } else {
                     questionAnswers.push(text);
@@ -5694,9 +5762,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.steers.delete(runKey);
       const steered = [...(this.steerTexts.get(runKey) ?? []), ...questionAnswers];
       this.steerTexts.delete(runKey);
-      // Общий лог беседы — зеркало видимой ленты: из него другой агент получит
-      // контекст. Отметку «видел до сих пор» двигаем, только если промпт реально
-      // дошёл до агента; свои же сообщения агенту не пересылаются (фильтр выше).
+      // Общий лог беседы — зеркало видимой ленты. Отметку «видел до сих пор»
+      // двигаем по подтверждающим событиям, включая session: неоднозначный
+      // сбой turn/start после подключения не должен повторять старые ответы.
       const answer = answerBuf.trim();
       // Вложения — частью записи: другой агент должен видеть пути файлов.
       const logUserText = attachBlock ? `${prompt}\n\n${attachBlock}` : prompt;
@@ -5706,7 +5774,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (messageId && r.sentMessages?.[messageId]) r.sentMessages[messageId].logCut = log.length;
           log.push({ agent, role: "user", text: clipLog(logUserText) });
         }
-        for (const t of steered) log.push({ agent, role: "user", text: clipLog(t) });
+        for (const t of steered) log.push({ agent, role: "user", text: clipLog(t),
+          ...(currentSessionId ? { acceptedSessionId: currentSessionId } : {}) });
         if (answer) log.push({ agent, role: "assistant", text: clipLog(answer) });
         const seen: Partial<Record<AgentId, number>> = { ...(r.chatSeen ?? {}) };
         if (delivered && !isSlashCommand) seen[agent] = log.length;

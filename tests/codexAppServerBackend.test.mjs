@@ -15,6 +15,7 @@ const mockKey = Symbol.for("agent-hub.codex-backend-tests");
 let current;
 globalThis[mockKey] = {
   spawn: (...args) => {
+    if (current.spawn) return current.spawn(...args);
     current.spawnArgs = args;
     return current.child;
   },
@@ -181,7 +182,7 @@ test("resuming long history omits stored turns from the startup response", async
   assert.deepEqual(h.events.filter((event) => event.kind === "session"), [{ kind: "session", sessionId: "resumed-main" }]);
 });
 
-for (const stage of ["initialize", "thread/start", "thread/resume", "thread/fork", "turn/start"]) {
+for (const stage of ["initialize", "thread/start", "thread/fork", "turn/start"]) {
   test(`an unanswered ${stage} startup request fails within 60 seconds without replay`, async (t) => {
     const clock = fakeClock(t);
     const h = await launch(t, {
@@ -522,6 +523,43 @@ test("confirmation resolved after abort cannot approve the cancelled turn", asyn
   await h.run;
 });
 
+for (const method of ["item/commandExecution/requestApproval", "item/tool/requestUserInput"]) {
+  test(`a late ${method} response after closed stdin cannot reject outside the completed run`, async t => {
+    const h = await launch(t);
+    let resolveConfirmation;
+    h.confirm = () => new Promise(resolve => { resolveConfirmation = resolve; });
+    const details = method === "item/tool/requestUserInput"
+      ? { questions: [{ id: "q", question: "Pending answer" }] } : { command: "pending" };
+    h.send({ id: 100, method, params: { ...h.scope(), ...details } });
+    await until(() => resolveConfirmation);
+    h.child.stdin.destroy();
+    h.child.exitCode = 1;
+    h.child.emit("exit", 1);
+    await h.run;
+    resolveConfirmation({ allow: true, answer: "late answer" });
+    await tick();
+    await tick();
+    assert.equal(h.writes.some(message => message.id === 100 && !message.method), false);
+    assert.equal(h.events.filter(event => event.kind === "result").length, 1);
+    assert.equal(h.events.at(-1).ok, false);
+  });
+}
+
+test("a failed live confirmation response ends the run with one reported failure", async t => {
+  const h = await launch(t);
+  let resolveConfirmation;
+  h.confirm = () => new Promise(resolve => { resolveConfirmation = resolve; });
+  h.send({ id: 100, method: "item/commandExecution/requestApproval", params: { ...h.scope(), command: "pending" } });
+  await until(() => resolveConfirmation);
+  h.child.stdin.destroy();
+  resolveConfirmation({ allow: true });
+  await h.run;
+  assert.equal(h.events.filter(event => event.kind === "result").length, 1);
+  assert.equal(h.events.at(-1).ok, false);
+  assert.ok(h.events.some(event => event.kind === "error" && /не удалось ответить/u.test(event.message)));
+  assert.equal(h.kills, 1);
+});
+
 test("abort between confirmation continuation and JSON-RPC write rejects the approval", async (t) => {
   const h = await launch(t);
   let resolveConfirmation;
@@ -729,3 +767,155 @@ test("ordinary Codex prompt captures only authoritative turn/start response ID",
  assert.deepEqual(h.events.find(e=>e.kind==="nativePrompt"),{kind:"nativePrompt",messageId:"host-user-uuid",anchor:{provider:"codex",sessionId:h.thread,turnId:"authoritative"}});
  h.complete("authoritative");await h.run;
 });
+
+async function launchResumeRecovery(t, { onRequest, onStop, onEvent, source = [{ id: "saved-one", status: "completed", items: [] }], config = {}, attachments, extraEnv, messageId } = {}) {
+  const h = current = { children: [], writes: [], calls: [], events: [], lifecycle: [], execCalls: [], processTracking: [], kills: 0, staleCleanup: true, abort: new AbortController(), steer: {}, done: false };
+  h.send = (child, message) => child.stdout.write(JSON.stringify(message) + "\n");
+  h.reply = (child, request, result) => h.send(child, { id: request.id, result });
+  h.stop = async child => {
+    if (child.exitCode !== null) return true;
+    h.lifecycle.push(`stop:${child.role}`);
+    if (onStop && (await onStop(child, h)) === false) return false;
+    child.exitCode = 0; child.emit("exit", 0); return true;
+  };
+  h.spawn = (...args) => {
+    const role = ["original", "helper", "replacement"][h.children.length] ?? "unexpected";
+    const child = new EventEmitter(); Object.assign(child, { harness: h, role, stdout: new PassThrough(), stderr: new PassThrough(), exitCode: null, spawnArgs: args });
+    h.children.push(child); h.lifecycle.push(`spawn:${role}`);
+    child.stdin = new Writable({ write(chunk, _encoding, callback) {
+      const request = JSON.parse(chunk.toString()); h.writes.push(request); h.calls.push({ role, request }); callback();
+      if (onRequest?.(role, request, h, child)) return;
+      if (request.method === "initialize") h.reply(child, request, {});
+      if (role === "helper" && request.method === "thread/turns/list") h.reply(child, request, { data: source, nextCursor: null });
+      if (role === "helper" && request.method === "thread/fork") h.reply(child, request, { thread: { id: "verified-fork" } });
+      if (role === "replacement" && request.method === "thread/resume") h.reply(child, request, { thread: { id: "verified-fork" }, model: "chosen-model" });
+      if (request.method === "turn/start") {
+        h.reply(child, request, { turn: { id: "new-task", status: "inProgress", items: [] } });
+        setImmediate(() => h.send(child, { method: "turn/completed", params: { threadId: "verified-fork", turn: { id: "new-task", status: "completed", items: [] } } }));
+      }
+    } });
+    return child;
+  };
+  h.run = (async () => {
+    try {
+      for await (const event of new CodexAppServerBackend().start("original work 📌", {
+        cwd: temp, resumeSessionId: "source-main", signal: h.abort.signal, config: { contextWindow: 0, ...config }, attachments, extraEnv, messageId, steer: h.steer,
+        confirmTool: async () => ({ allow: true, answer: "preserved" }),
+      })) { h.events.push(event); onEvent?.(event, h); }
+    } catch (err) { h.runError = err; }
+    finally { h.done = true; }
+  })();
+  t.after(async () => { h.releaseCleanup?.(); h.abort.abort(); for (const child of h.children) if (child.exitCode === null) { child.exitCode = 0; child.emit("exit", 0); } await h.run; });
+  await until(() => h.calls.some(c => c.role === "original" && c.request.method === "thread/resume"));
+  return h;
+}
+
+const tasks = h => h.calls.filter(c => c.request.method === "turn/start");
+
+for (const id of ["source-main", "unverified-thread", undefined]) {
+  test(`recovered resume must return the exact verified fork instead of ${id ?? "missing ID"}`, async t => {
+    const clock = fakeClock(t);
+    const h = await launchResumeRecovery(t, {
+      onRequest(role, request, h, child) {
+        if (role === "replacement" && request.method === "thread/resume") {
+          h.reply(child, request, { thread: { id } });
+          return true;
+        }
+      },
+    });
+    clock.advance(60_000);
+    await until(() => h.done || tasks(h).length > 0);
+    assert.equal(tasks(h).length, 0);
+    await until(() => h.done);
+    assert.equal(h.events.some(event => event.kind === "session"), false);
+    assert.equal(h.events.at(-1).ok, false);
+    assert.equal(h.execCalls.length, 0);
+    assert.equal(h.children.length, 3);
+    assert.equal(clock.pending, 0);
+  });
+}
+
+test("resume timeout stops old server, verifies a full history fork, then starts the task exactly once", async t => {
+  const clock = fakeClock(t), attachments = [{ path: "/tmp/picture.png", isImage: true }, { path: "/tmp/info.txt", isImage: false }];
+  const h = await launchResumeRecovery(t, { config: { model: "chosen-model", effort: "high", sandbox: "read-only" }, attachments, extraEnv: { TEST_RESUME_VALUE: "preserved" }, messageId: "host-user" });
+  clock.advance(60_000); await until(() => h.done);
+  assert.equal(h.runError, undefined);
+  assert.deepEqual(h.lifecycle, ["spawn:original", "stop:original", "spawn:helper", "stop:helper", "spawn:replacement", "stop:replacement"]);
+  assert.equal(tasks(h).length, 1); assert.equal(tasks(h)[0].role, "replacement");
+  assert.deepEqual(tasks(h)[0].request.params, { threadId: "verified-fork", input: [{ type: "text", text: "original work 📌" }, { type: "localImage", path: "/tmp/picture.png" }], effort: "high" });
+  const resume = h.calls.find(c => c.role === "replacement" && c.request.method === "thread/resume").request;
+  assert.deepEqual(resume.params, { threadId: "verified-fork", cwd: temp, model: "chosen-model", sandbox: "read-only", approvalPolicy: "never", excludeTurns: true });
+  assert.ok(h.children.every(child => child.spawnArgs[2].env.TEST_RESUME_VALUE === "preserved"));
+  assert.deepEqual(h.events.find(e => e.kind === "session"), { kind: "session", sessionId: "verified-fork", forkedFromSessionId: "source-main" });
+  assert.deepEqual(h.events.find(e => e.kind === "nativePrompt"), { kind: "nativePrompt", messageId: "host-user", anchor: { provider: "codex", sessionId: "verified-fork", turnId: "new-task" } });
+  assert.match(h.events.find(e => e.kind === "notice").text, /истор/iu);
+  assert.equal(h.events.filter(e => e.kind === "result").length, 1);
+  assert.equal(h.events.some(e => e.kind === "error"), false, "the old child's queued exit cannot leak into recovery");
+  assert.equal(h.events.at(-1).ok, true); assert.equal(h.execCalls.length, 0); assert.equal(clock.pending, 0); assert.equal(h.steer.handler, undefined);
+  const oldResume = h.calls.find(c => c.role === "original" && c.request.method === "thread/resume").request;
+  h.reply(h.children[0], oldResume, { thread: { id: "late-old" } }); await tick(); assert.equal(tasks(h).length, 1);
+});
+
+test("resume recovery waits for original cleanup and helper cleanup before starting later children", async t => {
+  const clock = fakeClock(t); let stopping;
+  const h = await launchResumeRecovery(t, { onStop(child, h) { if (child.role === "replacement") return; stopping = child.role; return new Promise(resolve => { h.releaseCleanup = resolve; }); } });
+  clock.advance(60_000); await until(() => stopping === "original");
+  assert.equal(h.children.length, 1); assert.equal(tasks(h).length, 0);
+  h.releaseCleanup(); await until(() => stopping === "helper");
+  assert.equal(h.children.length, 2); assert.equal(tasks(h).length, 0);
+  h.releaseCleanup(); await until(() => h.done); assert.equal(tasks(h).length, 1); assert.equal(h.events.at(-1).ok, true);
+});
+
+for (const stage of ["original-cleanup", "helper-read", "helper-cleanup", "notice", "replacement-resume"]) {
+  test(`abort during resume recovery ${stage} prevents the new task`, async t => {
+    const clock = fakeClock(t);
+    const h = await launchResumeRecovery(t, {
+      onStop(child, h) { if (stage === `${child.role}-cleanup`) h.abort.abort(); },
+      onEvent(event, h) { if (stage === "notice" && event.kind === "notice") h.abort.abort(); },
+      onRequest(role, request, h) { if ((stage === "helper-read" && role === "helper" && request.method === "thread/turns/list") || (stage === "replacement-resume" && role === "replacement" && request.method === "thread/resume")) { h.abort.abort(); return true; } },
+    });
+    clock.advance(60_000); await until(() => h.done);
+    assert.equal(tasks(h).length, 0); assert.equal(h.execCalls.length, 0); assert.equal(clock.pending, 0);
+    assert.equal(h.children.length, stage === "original-cleanup" ? 1 : stage === "replacement-resume" ? 3 : stage === "notice" ? 1 : 2);
+  });
+}
+
+for (const failure of ["helper-read", "helper-fork", "helper-mismatch", "helper-id", "original-cleanup", "helper-cleanup", "replacement-resume", "replacement-conflict"]) {
+  test(`resume recovery ${failure} failure is terminal without another fork, exec or task`, async t => {
+    const clock = fakeClock(t);
+    const h = await launchResumeRecovery(t, {
+      onStop(child) { if (failure === `${child.role}-cleanup`) return false; },
+      onRequest(role, request, h, child) {
+        if (role === "helper" && ((failure === "helper-read" && request.method === "thread/turns/list") || (failure === "helper-fork" && request.method === "thread/fork"))) { h.send(child, { id: request.id, error: { code: -32000, message: "history failed" } }); return true; }
+        if (role === "helper" && failure === "helper-id" && request.method === "thread/fork") { h.reply(child, request, { thread: { id: "source-main" } }); return true; }
+        if (role === "helper" && failure === "helper-mismatch" && request.method === "thread/turns/list" && request.params.threadId !== "source-main") { h.reply(child, request, { data: [], nextCursor: null }); return true; }
+        if (role === "replacement" && request.method === "thread/resume" && ["replacement-resume", "replacement-conflict"].includes(failure)) { h.send(child, { id: request.id, error: { code: -32000, message: failure === "replacement-conflict" ? "thread-store conflict" : "unsupported thread/resume" } }); return true; }
+      },
+    });
+    clock.advance(60_000); await until(() => h.done);
+    assert.equal(tasks(h).length, 0); assert.equal(h.execCalls.length, 0); assert.ok(h.children.length <= 3); assert.equal(h.events.at(-1)?.ok, false);
+    assert.equal(h.children.length, failure === "original-cleanup" ? 1 : failure.startsWith("replacement") ? 3 : 2, "the intended failure stage must actually be reached");
+    assert.equal(h.calls.filter(c => c.role === "replacement" && c.request.method === "thread/fork").length, 0);
+    assert.equal(clock.pending, 0);
+  });
+}
+
+test("closed app-server stdin fails immediately and clears startup deadlines", async t => {
+  const clock = fakeClock(t);
+  const h = await launch(t, { resume: true, start: false, waitFor: "done", onInitialize(request, h) { h.reply(request, {}); h.child.stdin.destroy(); } });
+  assert.equal(h.done, true);
+  assert.equal(clock.pending, 0);
+  assert.equal(h.turnRequests().length, 0);
+  assert.equal(h.writes.some(request => request.method === "thread/resume"), false);
+});
+
+for (const stage of ["helper-initialize", "helper-read", "helper-fork", "replacement-resume", "replacement-turn"]) {
+ test(`a second timeout at ${stage} is terminal and recovery stays bounded`, async t => {
+  const clock = fakeClock(t), methods = { "helper-initialize": "initialize", "helper-read": "thread/turns/list", "helper-fork": "thread/fork", "replacement-resume": "thread/resume", "replacement-turn": "turn/start" };
+  const role = stage.startsWith("helper") ? "helper" : "replacement";
+  const h = await launchResumeRecovery(t, { onRequest(currentRole, req) { return currentRole === role && req.method === methods[stage]; } });
+  clock.advance(60_000); await until(() => h.calls.some(c => c.role === role && c.request.method === methods[stage]));
+  clock.advance(60_000); await until(() => h.done);
+  assert.equal(h.events.at(-1).ok, false); assert.equal(h.execCalls.length, 0); assert.equal(tasks(h).length, stage === "replacement-turn" ? 1 : 0); assert.ok(h.children.length <= 3); assert.equal(clock.pending, 0);
+ });
+}

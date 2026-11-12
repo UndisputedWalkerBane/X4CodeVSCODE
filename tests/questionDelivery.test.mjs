@@ -165,6 +165,38 @@ test("late acknowledgement logs only to the originating record and never pollute
   assert.equal(h.starts.length, 1);
 });
 
+test("a late acknowledged answer is not replayed while an intervening undelivered message remains pending", async () => {
+  const ack = gate(); const h = await launch({ handler: () => ack.promise });
+  const answer = h.answer(); await until(() => h.steered.length === 1);
+  h.done.resolve(); await h.run;
+  const seenBefore = h.record.chatSeen.codex;
+  await h.p.runTurn("Unrelated undelivered message", "codex", [], temp, true);
+  ack.resolve(); await answer;
+  assert.equal(h.record.chatSeen.codex, seenBefore, "late acceptance must not skip the unrelated pending row");
+  assert.equal(h.record.chatLog.filter(entry => entry.text.includes("Да ✓")).length, 1);
+  await h.p.runTurn("Continue after late acknowledgement", "codex", [], temp, true);
+  assert.equal(h.starts[2].prompt.includes("Да ✓"), false);
+  assert.equal(h.starts[2].prompt.includes("Unrelated undelivered message"), true);
+});
+
+for (const verifiedFork of [true, false]) {
+  test(`late question ACK ${verifiedFork ? "follows a verified native fork" : "does not claim an unrelated native replacement"}`, async () => {
+    const ack = gate(); const followUpEvents = [];
+    const h = await launch({ handler: () => ack.promise, followUpEvents });
+    const answer = h.answer(); await until(() => h.steered.length === 1);
+    h.done.resolve(); await h.run;
+    followUpEvents.push({ kind: "session", sessionId: "replacement-session", ...(verifiedFork ? { forkedFromSessionId: "session-original" } : {}) });
+    await h.p.runTurn("Recover original session", "codex", [], temp, true);
+    followUpEvents.length = 0;
+    await h.p.runTurn("Intervening pending message", "codex", [], temp, true);
+    ack.resolve(); await answer;
+    assert.equal(h.record.chatLog.at(-1).acceptedSessionId, verifiedFork ? "replacement-session" : "session-original");
+    await h.p.runTurn("Continue after late acknowledgement", "codex", [], temp, true);
+    assert.equal(h.starts[3].prompt.includes("Да ✓"), !verifiedFork);
+    assert.equal(h.starts[3].prompt.includes("Intervening pending message"), true);
+  });
+}
+
 test("a completed run's old question never steers the unrelated currently active run", async () => {
   const h = await launch(); h.done.resolve(); await h.run;
   const foreign = [];

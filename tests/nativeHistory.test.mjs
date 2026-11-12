@@ -19,8 +19,10 @@ globalThis[key] = {
 };
 after(async () => { delete globalThis[key]; await rm(temp, { recursive: true, force: true }); });
 const outfile = join(temp, "backend.mjs");
+const entry = join(temp, "entry.mjs");
+await writeFile(entry, `export { CodexAppServerBackend } from ${JSON.stringify(fileURLToPath(new URL("../src/agents/codexAppServerBackend.ts", import.meta.url)))}; export * from ${JSON.stringify(fileURLToPath(new URL("../src/agents/nativeHistory.ts", import.meta.url)))};`);
 await build({
-  entryPoints: [fileURLToPath(new URL("../src/agents/codexAppServerBackend.ts", import.meta.url))],
+  entryPoints: [entry],
   outfile, bundle: true, platform: "node", format: "esm",
   plugins: [{ name: "native-edit-mocks", setup(b) {
     b.onResolve({filter:/^node:child_process$|^\.\/codexBackend$/}, ({path})=>({path,namespace:"mock"}));
@@ -36,7 +38,7 @@ await build({
         export const hardKill=(c)=>{c.exitCode=0;c.emit("exit",0)};` }));
   }}],
 });
-const { CodexAppServerBackend } = await import(pathToFileURL(outfile).href);
+const { CodexAppServerBackend, forkCodexHistoryForResume } = await import(pathToFileURL(outfile).href);
 function codexHarness(source, {fork=source.slice(0,1), failList=false, ignore, hang}={}) {
   const h = current = {child:new EventEmitter(),calls:[],stopped:0,tracked:0};
   Object.assign(h.child,{stdout:new PassThrough(),stderr:new PassThrough(),exitCode:null});
@@ -57,6 +59,14 @@ function codexHarness(source, {fork=source.slice(0,1), failList=false, ignore, h
 }
 const turn=(id,text=id)=>({id,status:"completed",items:[{id:`user-${id}`,type:"userMessage",content:[{type:"text",text}]}]});
 const opts=(anchor={provider:"codex",sessionId:"source",turnId:"two"})=>({cwd:temp,sessionId:"source",anchor,signal:new AbortController().signal,config:{contextWindow:0}});
+
+test("resume history rejects coerced terminal statuses before creating a fork", async () => {
+  const malformed = [{ ...turn("one"), status: ["completed"] }];
+  const h = codexHarness(malformed, { fork: malformed });
+  await assert.rejects(forkCodexHistoryForResume(opts()), /незаверш|истор/iu);
+  assert.equal(h.calls.some(request => request.method === "thread/fork"), false);
+  assert.equal(h.stopped, 1);
+});
 
 test("Codex native edit forks exact earlier prefix and never starts inference",async()=>{
   const source=[turn("one"),turn("two"),turn("three")];const h=codexHarness(source);
@@ -188,4 +198,85 @@ test("Codex missing-original fallback rejects a failed later page and abort with
   await assert.rejects(new CodexAppServerBackend().prepareEdit(missingOpts({ signal: ctrl.signal })), abort ? /отмен|abort/iu : /source read failed/);
   noNativeMutation(h); assert.deepEqual(source, before); assert.equal(h.stopped, 1);
  }
+});
+
+const resumeOpts = () => {
+ const { anchor, ...rest } = opts(); return rest;
+};
+test("resume recovery forks and verifies every terminal native turn without inference", async () => {
+ const source = [turn("one"), { ...turn("two"), status: "interrupted" }, { ...turn("three"), status: "failed" }];
+ const before = structuredClone(source), h = codexHarness(source, { fork: source });
+ assert.deepEqual(await forkCodexHistoryForResume(resumeOpts()), { resumeSessionId: "fork" });
+ assert.deepEqual(h.calls.find(r => r.method === "thread/fork").params, { threadId: "source", lastTurnId: "three", cwd: temp, excludeTurns: true });
+ assert.ok(h.calls.filter(r => r.method === "thread/turns/list").every(r => r.params.itemsView === "notLoaded"));
+ assert.equal(h.calls.some(r => ["thread/resume", "thread/start", "turn/start", "thread/revert"].includes(r.method)), false);
+ assert.deepEqual(source, before); assert.equal(h.stopped, 1); assert.equal(h.tracked, 1);
+});
+test("resume recovery refuses any nonterminal turn instead of dropping history", async () => {
+ for (const status of ["inProgress", "unknown", undefined, null]) {
+  const h = codexHarness([turn("one"), { ...turn("two"), status }]);
+  await assert.rejects(forkCodexHistoryForResume(resumeOpts()), /истор|заверш/iu);
+  assert.equal(h.calls.some(r => r.method === "thread/fork"), false); assert.equal(h.stopped, 1);
+ }
+});
+test("resume recovery verifies the entire ordered ID and status sequence", async () => {
+ const source = [turn("one"), turn("two"), turn("three")];
+ for (const fork of [source.slice(0, 2), [...source, turn("four")], [source[1], source[0], source[2]], [source[0], { ...source[1], status: "failed" }, source[2]], [source[0], source[0], source[2]]]) {
+  const h = codexHarness(source, { fork });
+  await assert.rejects(forkCodexHistoryForResume(resumeOpts()), /истор|границ/iu);
+  assert.equal(h.stopped, 1);
+ }
+});
+test("resume recovery requires a fresh nonempty fork ID and verifies legitimate empty history", async () => {
+ for (const ignore of ["source", "", " ", 42]) {
+  const h = codexHarness([turn("one")], { ignore });
+  await assert.rejects(forkCodexHistoryForResume(resumeOpts()), /тред|истор/iu); assert.equal(h.stopped, 1);
+ }
+ const h = codexHarness([], { fork: [] });
+ assert.deepEqual(await forkCodexHistoryForResume(resumeOpts()), { resumeSessionId: "fork" });
+ assert.equal(h.calls.find(r => r.method === "thread/fork").params.lastTurnId, undefined);
+});
+test("resume recovery reads all metadata pages and retains method-not-found read compatibility", async () => {
+ const source = [turn("one"), turn("two"), turn("three")], h = codexHarness(source, { fork: source });
+ const write = h.child.stdin._write;
+ h.child.stdin._write = (chunk, e, cb) => {
+  const req = JSON.parse(chunk.toString()); if (req.method !== "thread/turns/list") return write(chunk, e, cb);
+  h.calls.push(req); cb(); assert.equal(req.params.itemsView, "notLoaded");
+  const index = Number(req.params.cursor ?? 0);
+  h.child.stdout.write(JSON.stringify({ id: req.id, result: { data: [source[index]], nextCursor: index < 2 ? String(index + 1) : null } }) + "\n");
+ };
+ assert.deepEqual(await forkCodexHistoryForResume(resumeOpts()), { resumeSessionId: "fork" });
+ assert.equal(h.calls.filter(r => r.method === "thread/turns/list").length, 6);
+ const fallback = codexHarness(source, { fork: source, failList: true });
+ await forkCodexHistoryForResume(resumeOpts()); assert.equal(fallback.calls.filter(r => r.method === "thread/read").length, 2);
+});
+test("resume recovery rejects duplicate turns, bad cursors and noncompatibility read failures", async () => {
+ for (const mode of ["duplicate", "cursor", "repeat", "read-error", "malformed"]) {
+  const h = codexHarness([turn("one")]); const write = h.child.stdin._write;
+  h.child.stdin._write = (chunk, e, cb) => {
+   const req = JSON.parse(chunk.toString()); if (req.method !== "thread/turns/list") return write(chunk, e, cb);
+   h.calls.push(req); cb();
+   const result = { data: mode === "duplicate" ? [turn("one"), turn("one")] : mode === "malformed" ? [{ id: "", status: "completed", items: [] }] : [turn("one")], nextCursor: mode === "cursor" ? 42 : mode === "repeat" ? "same" : null };
+   h.child.stdout.write(JSON.stringify(mode === "read-error" ? { id: req.id, error: { code: -32000, message: "read failed" } } : { id: req.id, result }) + "\n");
+  };
+  await assert.rejects(forkCodexHistoryForResume(resumeOpts()));
+  assert.equal(h.calls.some(r => r.method === "thread/read" || r.method === "thread/fork"), false); assert.equal(h.stopped, 1);
+ }
+});
+test("resume recovery waits for confirmed helper cleanup and aborts after cleanup", async () => {
+ const h = codexHarness([turn("one")], { fork: [turn("one")] }), ctrl = new AbortController();
+ const stop = globalThis[key].stop; let release, done = false;
+ globalThis[key].stop = async child => { h.stopped++; await new Promise(resolve => { release = resolve; }); child.exitCode = 0; child.emit("exit", 0); return true; };
+ try {
+  const pending = forkCodexHistoryForResume({ ...resumeOpts(), signal: ctrl.signal }); pending.finally(() => { done = true; }).catch(() => {});
+  while (!release) await new Promise(r => setImmediate(r));
+  assert.equal(done, false); ctrl.abort(); release(); await assert.rejects(pending, /abort/iu);
+ } finally { globalThis[key].stop = stop; release?.(); }
+});
+test("resume recovery cannot return a usable ID after failed cleanup", async () => {
+ const h = codexHarness([turn("one")], { fork: [turn("one")] }), stop = globalThis[key].stop;
+ globalThis[key].stop = async () => false;
+ try { await assert.rejects(forkCodexHistoryForResume(resumeOpts()), /процесс/iu); }
+ finally { globalThis[key].stop = stop; }
+ assert.equal(h.calls.some(r => r.method === "turn/start"), false);
 });

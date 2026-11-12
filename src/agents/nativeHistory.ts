@@ -49,10 +49,15 @@ export function uniqueLegacyIndex(texts: (string | undefined)[], prompt: string 
   return matches[0];
 }
 
-/** Fork persisted history only. This connection never resumes a thread or starts inference. */
-export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<PreparedEdit> {
+type CodexHistoryOptions = Pick<PrepareEditOptions, "cwd" | "sessionId" | "config" | "extraEnv" | "signal">;
+type HistoryClient = {
+  request: (method: string, params: Json) => Promise<Json>;
+  readTurns: (threadId: string, full: boolean) => Promise<Json[]>;
+};
+
+/** A separate owned connection for persisted history; never resumes or starts inference. */
+async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: HistoryClient) => Promise<T>): Promise<T> {
   opts.signal.throwIfAborted();
-  if (!opts.sessionId || (opts.anchor && (opts.anchor.provider !== "codex" || opts.anchor.sessionId !== opts.sessionId))) throw unavailable();
   const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
     cwd: opts.cwd, env: { ...process.env, ...(opts.extraEnv ?? {}) },
     stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,
@@ -62,8 +67,9 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
   let nextId = 0;
   const rejectAll = (err: Error) => { for (const entry of [...pending.values()]) entry.reject(err); };
   const onAbort = () => rejectAll(new Error("Подготовка редактирования отменена."));
-  const onError = (err: Error) => rejectAll(err);
-  const onExit = () => rejectAll(new Error("Codex закрыл соединение при чтении истории."));
+  let connectionError: Error | undefined;
+  const onError = (err: Error) => { connectionError = err; rejectAll(err); };
+  const onExit = () => onError(new Error("Codex закрыл соединение при чтении истории."));
   child.on("error", onError);
   child.on("exit", onExit);
   // Drain stderr without retaining provider output or unrelated local data.
@@ -82,21 +88,21 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
   opts.signal.addEventListener("abort", onAbort, { once: true });
   const request = (method: string, params: Json) => new Promise<Json>((resolve, reject) => {
     if (opts.signal.aborted) { reject(new Error("Подготовка редактирования отменена.")); return; }
+    if (connectionError) { reject(connectionError); return; }
     const id = ++nextId;
     const timer = setTimeout(() => pending.get(id)?.reject(new Error(`Codex ${method}: истекло время ожидания истории (60 с). Обновите CLI и повторите.`)), EDIT_TIMEOUT_MS);
     timer.unref();
     const settle = () => { pending.delete(id); clearTimeout(timer); };
     pending.set(id, { resolve: (value) => { settle(); resolve(value); }, reject: (err) => { settle(); reject(err); } });
     try {
-      if (!child.stdin.writable) throw new Error("Codex: соединение закрыто");
+      if (!child.stdin.writable || child.stdin.destroyed || child.stdin.writableEnded) throw new Error("Codex: соединение закрыто");
       child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
     } catch (err) { pending.get(id)?.reject(err instanceof Error ? err : new Error(String(err))); }
   });
-  const readTurns = async (threadId: string): Promise<Json[]> => {
+  const readTurns = async (threadId: string, full: boolean): Promise<Json[]> => {
     const turns: Json[] = [];
     let cursor: string | undefined;
     const seen = new Set<string>();
-    const full = !opts.anchor;
     let pages = 0;
     try {
       do {
@@ -118,15 +124,39 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
     }
     const ids = new Set<string>();
     for (const turn of turns) {
-      if (!isJson(turn) || typeof turn.id !== "string" || !turn.id || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
+      if (!isJson(turn) || typeof turn.id !== "string" || !turn.id.trim() || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
       ids.add(turn.id);
     }
     return turns;
   };
+  let result: T;
   try {
     await request("initialize", { clientInfo: { name: "agent-hub", title: "Agent Hub", version: "1.0.0" } });
+    opts.signal.throwIfAborted();
+    if (!child.stdin.writable || child.stdin.destroyed || child.stdin.writableEnded) throw new Error("Codex: соединение закрыто");
     child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
-    const source = await readTurns(opts.sessionId);
+    result = await use({ request, readTurns });
+  } finally {
+    opts.signal.removeEventListener("abort", onAbort);
+    rejectAll(new Error("Codex: соединение закрыто"));
+    rl.close();
+    try {
+      if (!(await stopCodex(child))) throw new Error("Не удалось завершить собственный процесс подготовки истории Codex.");
+    } finally {
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+    }
+  }
+  opts.signal.throwIfAborted();
+  return result;
+}
+
+/** Fork persisted history only. This connection never resumes a thread or starts inference. */
+export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<PreparedEdit> {
+  opts.signal.throwIfAborted();
+  if (!opts.sessionId || (opts.anchor && (opts.anchor.provider !== "codex" || opts.anchor.sessionId !== opts.sessionId))) throw unavailable();
+  return withCodexHistory(opts, async ({ request, readTurns }) => {
+    const source = await readTurns(opts.sessionId, !opts.anchor);
     const matches = opts.anchor ? [] : legacyMatches(source.map(firstUserText), opts.legacyPrompt);
     if (!opts.anchor && matches.length !== 1) {
       if (!matches.length && opts.allowSavedContextFallback === true && originalAbsent(source, opts.legacyPrompt)) {
@@ -145,17 +175,34 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
     const fork = await request("thread/fork", { threadId: opts.sessionId, lastTurnId: prefix.at(-1)?.id, cwd: opts.cwd, excludeTurns: true });
     const id = (fork.thread as Json | undefined)?.id;
     if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред для редактирования. Обновите CLI.");
-    const actual = await readTurns(id);
+    const actual = await readTurns(id, !opts.anchor);
     const comparable = (turns: Json[]) => turns.map(({ id, status, items }) => opts.anchor ? { id, status } : { id, status, items });
     if (!isDeepStrictEqual(comparable(prefix), comparable(actual))) throw new Error("Codex не подтвердил точную границу истории: выбранный или последующий ход мог попасть в копию. Обновите CLI; исходный чат сохранён.");
     opts.signal.throwIfAborted();
     return { resumeSessionId: id };
-  } finally {
-    opts.signal.removeEventListener("abort", onAbort);
-    rejectAll(new Error("Codex: соединение закрыто"));
-    rl.close();
-    if (!(await stopCodex(child))) throw new Error("Не удалось завершить собственный процесс подготовки истории Codex.");
-    child.removeListener("error", onError);
-    child.removeListener("exit", onExit);
-  }
+  });
+}
+
+/** Copy every persisted terminal turn before a single bounded resume-timeout recovery. */
+export async function forkCodexHistoryForResume(opts: CodexHistoryOptions): Promise<{ resumeSessionId: string }> {
+  opts.signal.throwIfAborted();
+  if (typeof opts.sessionId !== "string" || !opts.sessionId.trim()) throw new Error("Codex: отсутствует исходный тред истории.");
+  return withCodexHistory(opts, async ({ request, readTurns }) => {
+    const source = await readTurns(opts.sessionId, false);
+    if (source.some(turn => typeof turn.status !== "string" || !["completed", "interrupted", "failed"].includes(turn.status))) {
+      throw new Error("История Codex содержит незавершённые ходы; копирование остановлено, исходный чат сохранён.");
+    }
+    const fork = await request("thread/fork", {
+      threadId: opts.sessionId, ...(source.length ? { lastTurnId: source.at(-1)?.id } : {}), cwd: opts.cwd, excludeTurns: true,
+    });
+    const id = (fork.thread as Json | undefined)?.id;
+    if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред с копией истории.");
+    const actual = await readTurns(id, false);
+    const metadata = (turns: Json[]) => turns.map(({ id, status }) => ({ id, status }));
+    if (!isDeepStrictEqual(metadata(source), metadata(actual))) {
+      throw new Error("Codex не подтвердил полную копию истории; исходный чат сохранён.");
+    }
+    opts.signal.throwIfAborted();
+    return { resumeSessionId: id };
+  });
 }
