@@ -38,7 +38,7 @@ await build({
         export const hardKill=(c)=>{c.exitCode=0;c.emit("exit",0)};` }));
   }}],
 });
-const { CodexAppServerBackend, forkCodexHistoryForResume } = await import(pathToFileURL(outfile).href);
+const { CodexAppServerBackend, forkCodexHistoryForResume, forkCodexHistoryOnConnection } = await import(pathToFileURL(outfile).href);
 function codexHarness(source, {fork=source.slice(0,1), failList=false, ignore, hang}={}) {
   const h = current = {child:new EventEmitter(),calls:[],stopped:0,tracked:0};
   Object.assign(h.child,{stdout:new PassThrough(),stderr:new PassThrough(),exitCode:null});
@@ -279,4 +279,59 @@ test("resume recovery cannot return a usable ID after failed cleanup", async () 
  try { await assert.rejects(forkCodexHistoryForResume(resumeOpts()), /процесс/iu); }
  finally { globalThis[key].stop = stop; }
  assert.equal(h.calls.some(r => r.method === "turn/start"), false);
+});
+
+
+test("connection-bound recovery returns the complete fork ACK without spawning or closing its caller connection", async () => {
+ const source = [turn("one"), { ...turn("two"), status: "failed" }], calls = [];
+ const h = codexHarness(source), response = { thread: { id: "ready-fork", status: { type: "idle" } }, model: "server-model", modelProvider: "openai" };
+ const request = async (method, params) => {
+  calls.push({ method, params });
+  if (method === "thread/turns/list") return { data: source.map(({ id, status }) => ({ id, status, items: [] })), nextCursor: null };
+  if (method === "thread/fork") return response;
+  throw Error(`unexpected request ${method}`);
+ };
+ const common = { cwd: temp, model: "chosen-model", sandbox: "danger-full-access", approvalPolicy: "never" };
+ assert.deepEqual(await forkCodexHistoryOnConnection(resumeOpts(), request, common), { resumeSessionId: "ready-fork", response });
+ assert.deepEqual(calls.find(r => r.method === "thread/fork").params, { threadId: "source", lastTurnId: "two", ...common, excludeTurns: true });
+ assert.equal(h.spawnArgs, undefined); assert.equal(h.stopped, 0); assert.equal(h.tracked, 0);
+ assert.equal(calls.some(r => ["initialize", "thread/resume", "turn/start"].includes(r.method)), false);
+});
+
+for (const status of [{ type: "active", activeFlags: [] }, { type: "notLoaded" }, { type: "systemError" }, "active"]) {
+ test(`connection-bound recovery rejects a known unready fork ${JSON.stringify(status)}`, async () => {
+  const calls = [];
+  await assert.rejects(forkCodexHistoryOnConnection(resumeOpts(), async (method, params) => {
+   calls.push({ method, params });
+   return method === "thread/fork" ? { thread: { id: "fork", status } } : { data: [turn("one")], nextCursor: null };
+  }, { cwd: temp }), /готов|состояни|загруж/iu);
+  assert.equal(calls.filter(r => r.method === "thread/turns/list").length, 1);
+ });
+}
+
+for (const status of [undefined, { type: "idle" }]) {
+ test(`connection-bound recovery supports fork ACK status ${JSON.stringify(status)}`, async () => {
+  const result = await forkCodexHistoryOnConnection(resumeOpts(), async method => method === "thread/fork" ? { thread: { id: "fork", ...(status ? { status } : {}) } } : { data: [], nextCursor: null }, { cwd: temp });
+  assert.equal(result.resumeSessionId, "fork");
+ });
+}
+
+
+test("connection-bound recovery accepts unloaded source fallback and verifies an idle fork fallback", async () => {
+ const calls = [], source = [turn("one")];
+ const result = await forkCodexHistoryOnConnection(resumeOpts(), async (method, params) => {
+  calls.push({ method, params });
+  if (method === "thread/turns/list") throw Object.assign(Error("old CLI"), { code: -32601 });
+  if (method === "thread/fork") return { thread: { id: "fork", status: { type: "idle" } } };
+  return { thread: { id: params.threadId, status: { type: params.threadId === "source" ? "notLoaded" : "idle" }, turns: source } };
+ }, { cwd: temp });
+ assert.equal(result.resumeSessionId, "fork"); assert.equal(calls.filter(r => r.method === "thread/read").length, 2);
+});
+
+test("connection-bound recovery tolerates missing status on older fallback responses", async () => {
+ const result = await forkCodexHistoryOnConnection(resumeOpts(), async (method, params) => {
+  if (method === "thread/turns/list") throw Object.assign(Error("old CLI"), { code: -32601 });
+  return method === "thread/fork" ? { thread: { id: "fork" } } : { thread: { id: params.threadId, turns: [] } };
+ }, { cwd: temp });
+ assert.equal(result.resumeSessionId, "fork");
 });

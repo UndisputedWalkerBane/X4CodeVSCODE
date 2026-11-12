@@ -55,6 +55,41 @@ type HistoryClient = {
   readTurns: (threadId: string, full: boolean) => Promise<Json[]>;
 };
 
+/** Read ordered native turns without owning or closing the supplied connection. */
+async function readCodexHistoryTurns(
+  request: HistoryClient["request"], threadId: string, full: boolean, validateThread?: (thread: Json) => void,
+): Promise<Json[]> {
+  const turns: Json[] = [];
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  let pages = 0;
+  try {
+    do {
+      if (++pages > 1_000) throw new Error("История Codex слишком велика для безопасного чтения; выберите более новый чат.");
+      const page = await request("thread/turns/list", { threadId, sortDirection: "asc", itemsView: full ? "full" : "notLoaded", limit: 100, ...(cursor ? { cursor } : {}) });
+      if (!Array.isArray(page.data)) throw new Error("Codex не вернул полную историю ходов.");
+      turns.push(...page.data as Json[]);
+      if (page.nextCursor != null && typeof page.nextCursor !== "string") throw new Error("Codex вернул неверный курсор истории.");
+      cursor = page.nextCursor as string | undefined;
+      if (cursor && seen.has(cursor)) throw new Error("Codex повторил страницу истории.");
+      if (cursor) seen.add(cursor);
+    } while (cursor);
+  } catch (err) {
+    if ((err as {code?: unknown}).code !== -32601) throw err;
+    const response = await request("thread/read", { threadId, includeTurns: true });
+    const thread = response.thread as Json | undefined;
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) throw new Error("Codex не поддерживает чтение полной нативной истории. Обновите CLI.");
+    validateThread?.(thread);
+    turns.splice(0, turns.length, ...thread.turns as Json[]);
+  }
+  const ids = new Set<string>();
+  for (const turn of turns) {
+    if (!isJson(turn) || typeof turn.id !== "string" || !turn.id.trim() || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
+    ids.add(turn.id);
+  }
+  return turns;
+}
+
 /** A separate owned connection for persisted history; never resumes or starts inference. */
 async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: HistoryClient) => Promise<T>): Promise<T> {
   opts.signal.throwIfAborted();
@@ -99,36 +134,7 @@ async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: Hist
       child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
     } catch (err) { pending.get(id)?.reject(err instanceof Error ? err : new Error(String(err))); }
   });
-  const readTurns = async (threadId: string, full: boolean): Promise<Json[]> => {
-    const turns: Json[] = [];
-    let cursor: string | undefined;
-    const seen = new Set<string>();
-    let pages = 0;
-    try {
-      do {
-        if (++pages > 1_000) throw new Error("История Codex слишком велика для безопасного чтения; выберите более новый чат.");
-        const page = await request("thread/turns/list", { threadId, sortDirection: "asc", itemsView: full ? "full" : "notLoaded", limit: 100, ...(cursor ? { cursor } : {}) });
-        if (!Array.isArray(page.data)) throw new Error("Codex не вернул полную историю ходов.");
-        turns.push(...page.data as Json[]);
-        if (page.nextCursor != null && typeof page.nextCursor !== "string") throw new Error("Codex вернул неверный курсор истории.");
-        cursor = page.nextCursor as string | undefined;
-        if (cursor && seen.has(cursor)) throw new Error("Codex повторил страницу истории.");
-        if (cursor) seen.add(cursor);
-      } while (cursor);
-    } catch (err) {
-      if ((err as {code?: unknown}).code !== -32601) throw err;
-      const response = await request("thread/read", { threadId, includeTurns: true });
-      const thread = response.thread as Json | undefined;
-      if (thread?.id !== threadId || !Array.isArray(thread.turns)) throw new Error("Codex не поддерживает чтение полной нативной истории. Обновите CLI.");
-      turns.splice(0, turns.length, ...thread.turns as Json[]);
-    }
-    const ids = new Set<string>();
-    for (const turn of turns) {
-      if (!isJson(turn) || typeof turn.id !== "string" || !turn.id.trim() || ids.has(turn.id) || !Array.isArray(turn.items) || (full && turn.itemsView != null && turn.itemsView !== "full")) throw new Error("Codex вернул неполную или неоднозначную историю.");
-      ids.add(turn.id);
-    }
-    return turns;
-  };
+  const readTurns = (threadId: string, full: boolean) => readCodexHistoryTurns(request, threadId, full);
   let result: T;
   try {
     await request("initialize", { clientInfo: { name: "agent-hub", title: "Agent Hub", version: "1.0.0" } });
@@ -183,26 +189,49 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
   });
 }
 
-/** Copy every persisted terminal turn before a single bounded resume-timeout recovery. */
+/** Respect known thread readiness while allowing older CLI responses without status. */
+function requireHistoryThreadReady(thread: Json, source: boolean): void {
+  if (thread.status == null) return;
+  const status = isJson(thread.status) ? thread.status.type : thread.status;
+  if (status !== "idle" && !(source && status === "notLoaded")) {
+    throw new Error("Codex вернул тред в неготовом состоянии; задание не отправлено, исходный чат сохранён.");
+  }
+}
+
+/** Verify a complete fork on the caller's live connection; it stays loaded after the ACK. */
+export async function forkCodexHistoryOnConnection(
+  opts: CodexHistoryOptions, request: HistoryClient["request"], common: Json,
+): Promise<{ resumeSessionId: string; response: Json }> {
+  opts.signal.throwIfAborted();
+  if (typeof opts.sessionId !== "string" || !opts.sessionId.trim()) throw new Error("Codex: отсутствует исходный тред истории.");
+  const source = await readCodexHistoryTurns(request, opts.sessionId, false, thread => requireHistoryThreadReady(thread, true));
+  if (source.some(turn => typeof turn.status !== "string" || !["completed", "interrupted", "failed"].includes(turn.status))) {
+    throw new Error("История Codex содержит незавершённые ходы; копирование остановлено, исходный чат сохранён.");
+  }
+  opts.signal.throwIfAborted();
+  const response = await request("thread/fork", {
+    ...common, threadId: opts.sessionId, ...(source.length ? { lastTurnId: source.at(-1)?.id } : {}), excludeTurns: true,
+  });
+  opts.signal.throwIfAborted();
+  const thread = response.thread as Json | undefined;
+  const id = thread?.id;
+  if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред с копией истории.");
+  requireHistoryThreadReady(thread!, false);
+  const actual = await readCodexHistoryTurns(request, id, false, thread => requireHistoryThreadReady(thread, false));
+  const metadata = (turns: Json[]) => turns.map(({ id, status }) => ({ id, status }));
+  if (!isDeepStrictEqual(metadata(source), metadata(actual))) {
+    throw new Error("Codex не подтвердил полную копию истории; исходный чат сохранён.");
+  }
+  opts.signal.throwIfAborted();
+  return { resumeSessionId: id, response };
+}
+
+/** Compatibility helper for callers that only need a persisted fork ID. */
 export async function forkCodexHistoryForResume(opts: CodexHistoryOptions): Promise<{ resumeSessionId: string }> {
   opts.signal.throwIfAborted();
   if (typeof opts.sessionId !== "string" || !opts.sessionId.trim()) throw new Error("Codex: отсутствует исходный тред истории.");
-  return withCodexHistory(opts, async ({ request, readTurns }) => {
-    const source = await readTurns(opts.sessionId, false);
-    if (source.some(turn => typeof turn.status !== "string" || !["completed", "interrupted", "failed"].includes(turn.status))) {
-      throw new Error("История Codex содержит незавершённые ходы; копирование остановлено, исходный чат сохранён.");
-    }
-    const fork = await request("thread/fork", {
-      threadId: opts.sessionId, ...(source.length ? { lastTurnId: source.at(-1)?.id } : {}), cwd: opts.cwd, excludeTurns: true,
-    });
-    const id = (fork.thread as Json | undefined)?.id;
-    if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред с копией истории.");
-    const actual = await readTurns(id, false);
-    const metadata = (turns: Json[]) => turns.map(({ id, status }) => ({ id, status }));
-    if (!isDeepStrictEqual(metadata(source), metadata(actual))) {
-      throw new Error("Codex не подтвердил полную копию истории; исходный чат сохранён.");
-    }
-    opts.signal.throwIfAborted();
-    return { resumeSessionId: id };
+  return withCodexHistory(opts, async ({ request }) => {
+    const fork = await forkCodexHistoryOnConnection(opts, request, { cwd: opts.cwd });
+    return { resumeSessionId: fork.resumeSessionId };
   });
 }

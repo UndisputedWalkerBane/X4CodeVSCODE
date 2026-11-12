@@ -12,12 +12,12 @@ import {
   trackCodexProcess,
 } from "./codexBackend";
 
-import { forkCodexHistoryForResume, prepareCodexEdit } from "./nativeHistory";
+import { forkCodexHistoryOnConnection, prepareCodexEdit } from "./nativeHistory";
 
 type Json = Record<string, unknown>;
 type End = { kind: "__end" };
 const STARTUP_REQUEST_TIMEOUT_MS = 60_000;
-const STARTUP_METHODS = new Set(["initialize", "thread/start", "thread/resume", "thread/fork", "turn/start"]);
+const STARTUP_METHODS = new Set(["initialize", "thread/start", "thread/resume", "thread/fork", "turn/start", "thread/turns/list", "thread/read"]);
 
 class StartupRequestTimeoutError extends Error {
   constructor(readonly method: string) {
@@ -71,11 +71,7 @@ export class CodexAppServerBackend implements AgentBackend {
             text: "⚠️ thread/resume Codex не ответил за 60 с. Копирую всю сохранённую историю в отдельный тред и проверяю её перед продолжением. Исходный чат сохранён.",
           };
           if (opts.signal.aborted) return;
-          const fork = await forkCodexHistoryForResume({
-            cwd: opts.cwd, sessionId: opts.resumeSessionId, config: opts.config, extraEnv: opts.extraEnv, signal: opts.signal,
-          });
-          if (opts.signal.aborted) return;
-          yield* this.startAttempt(prompt, { ...opts, resumeSessionId: fork.resumeSessionId }, {
+          yield* this.startAttempt(prompt, opts, {
             kind: "resumeRecovery", sourceSessionId: opts.resumeSessionId, startedAt,
           });
           return;
@@ -96,7 +92,7 @@ export class CodexAppServerBackend implements AgentBackend {
     const startedAt = context.startedAt;
 
     if (opts.signal.aborted) return;
-    if (opts.resumeSessionId && !(await stopStaleCodex(opts.resumeSessionId))) {
+    if (context.kind === "initial" && opts.resumeSessionId && !(await stopStaleCodex(opts.resumeSessionId))) {
       yield { kind: "error", message: "Не удалось завершить предыдущий процесс Codex этого треда. Повторный запуск остановлен." };
       yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
       return;
@@ -417,7 +413,8 @@ export class CodexAppServerBackend implements AgentBackend {
       if (id !== undefined && (m.result !== undefined || m.error !== undefined) && pending.has(id)) {
         const pr = pending.get(id);
         if (m.error) {
-          pr?.reject(new Error(String((m.error as { message?: string }).message ?? JSON.stringify(m.error))));
+          const error = m.error as Json;
+          pr?.reject(Object.assign(new Error(String(error.message ?? JSON.stringify(error))), { code: error.code }));
         } else {
           pr?.resolve((m.result as Json) ?? {});
         }
@@ -497,7 +494,13 @@ export class CodexAppServerBackend implements AgentBackend {
           ...(cfg.model ? { model: cfg.model } : {}),
         };
         let th: Json;
-        if (opts.resumeSessionId) {
+        if (context.kind === "resumeRecovery") {
+          const fork = await forkCodexHistoryOnConnection({
+            cwd: opts.cwd, sessionId: context.sourceSessionId, config: cfg, extraEnv: opts.extraEnv, signal: opts.signal,
+          }, request, common);
+          th = fork.response;
+          threadId = fork.resumeSessionId;
+        } else if (opts.resumeSessionId) {
           try {
             th = await request("thread/resume", { threadId: opts.resumeSessionId, ...common, excludeTurns: true });
           } catch (err) {
@@ -526,9 +529,6 @@ export class CodexAppServerBackend implements AgentBackend {
           th = await request("thread/start", common);
         }
         if (opts.signal.aborted) return;
-        if (context.kind === "resumeRecovery" && (th.thread as Json | undefined)?.id !== opts.resumeSessionId) {
-          throw new Error("Codex подключился не к проверенной копии истории; задание не отправлено.");
-        }
         threadId = String((th.thread as Json | undefined)?.id ?? threadId ?? "");
         threadReady = true;
         if (threadId) {
