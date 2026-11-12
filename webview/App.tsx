@@ -24,7 +24,7 @@ import type {
 import { projectKey } from "../src/shared/projectIdentity";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
 import { TaskCheckpoint, type TaskSnapshot } from "./TaskCheckpoint";
-import { ProjectAccesses, type ProjectAccessSnapshot } from "./ProjectAccesses";
+import { ProjectAccesses, type ProjectAccessSnapshot, type ProjectAccessTestResult } from "./ProjectAccesses";
 import { appendTaskCheckpoint, isTaskIdentity } from "../src/shared/taskState";
 
 import {
@@ -50,7 +50,7 @@ const CHAT_COMMAND_TYPES = new Set([
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
   "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
-  "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess",
+  "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess", "testProjectAccess",
   "prepareMessageEdit", "editMessage",
 ]);
 const CHAT_EVENT_TYPES = new Set([
@@ -59,7 +59,7 @@ const CHAT_EVENT_TYPES = new Set([
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
   "agentInfo", "effortInfo", "taskState",
-  "projectAccesses",
+  "projectAccesses", "projectAccessTestResult",
   "messageEditPrepared", "editMessageResult",
 ]);
 
@@ -378,6 +378,7 @@ function ChatTile({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
   const [projectAccessSnapshot, setProjectAccessSnapshot] = useState<ProjectAccessSnapshot | null>(null);
+  const [projectAccessTestResult, setProjectAccessTestResult] = useState<ProjectAccessTestResult | null>(null);
   const projectAccessProjectRef = useRef<string | null>(null);
   projectAccessProjectRef.current = settingsOpen && form?.project ? projectKey(form.project) : null;
   const [newPassword, setNewPassword] = useState<string | undefined>(undefined);
@@ -850,6 +851,9 @@ function ChatTile({
           break;
         case "projectAccesses":
           if (!REMOTE && msg.projectPath === projectAccessProjectRef.current) setProjectAccessSnapshot(msg);
+          break;
+        case "projectAccessTestResult":
+          if (!REMOTE && msg.projectPath === projectAccessProjectRef.current) setProjectAccessTestResult(msg);
           break;
         case "serverTestResult":
           updateServerTest(finishServerTest(serverTestRef.current, msg, serverDraftRef.current));
@@ -1640,6 +1644,7 @@ function ChatTile({
                     projectPath={projectKey(form.project)}
                     chatId={chatId}
                     snapshot={projectAccessSnapshot}
+                    testResult={projectAccessTestResult}
                     onPost={post}
                   />}
                   <label className="set-row">

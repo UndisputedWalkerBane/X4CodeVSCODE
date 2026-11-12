@@ -10,12 +10,65 @@ const temp = await mkdtemp(join(tmpdir(), "agent-hub-access-unit-"));
 after(() => rm(temp, { recursive: true, force: true }));
 const outfile = join(temp, "accesses.mjs");
 await build({ entryPoints: [fileURLToPath(new URL("../src/projectAccesses.ts", import.meta.url))], outfile, bundle: true, platform: "node", format: "esm" });
-const { parseProjectAccessStore, saveProjectAccess, deleteProjectAccess, summarizeProjectAccesses, mergeProjectAccessEnvironment, projectAccessesKey } = await import(pathToFileURL(outfile).href);
+const { parseProjectAccessStore, saveProjectAccess, deleteProjectAccess, summarizeProjectAccesses, mergeProjectAccessEnvironment, projectAccessesKey, resolveProjectAccessConnection } = await import(pathToFileURL(outfile).href);
 const id = "12345678-1234-4234-8234-123456789abc";
 const prefix = "AGENT_HUB_ACCESS_12345678123442348234123456789ABC_";
 const input = (patch = {}) => ({ name: "  Database 🔐  ", purpose: "  Reports  ", values: { password: "  secret\n'`$🗝  ", url: "https://fixture.invalid" }, ...patch });
 const empty = () => parseProjectAccessStore(undefined);
 const create = () => saveProjectAccess(empty(), input(), {}, () => id);
+
+test("connection and repository metadata round-trip without changing v1 legacy cards or environment names", () => {
+  const legacy = create();
+  assert.equal(summarizeProjectAccesses(legacy)[0].protocol, undefined);
+  const changed = saveProjectAccess(legacy, input({ id, protocol: "sftp", port: 2222, repository: "  https://github.com/example/repo.git  ", values: {} }), {});
+  const summary = summarizeProjectAccesses(parseProjectAccessStore(JSON.stringify(changed)))[0];
+  assert.equal(summary.protocol, "sftp"); assert.equal(summary.port, 2222); assert.equal(summary.repository, "https://github.com/example/repo.git");
+  assert.equal(summary.envNames.password, prefix + "PASSWORD");
+  const cleared = saveProjectAccess(changed, input({ id, repository: "  ", values: {} }), {});
+  assert.equal(cleared.entries[0].protocol, undefined); assert.equal(cleared.entries[0].port, undefined); assert.equal(cleared.entries[0].repository, undefined);
+  for (const patch of [{ protocol: "https" }, { port: 65536 }, { repository: "https://user:secret@github.com/owner/repo" }]) {
+    const unsafe = structuredClone(changed); Object.assign(unsafe.entries[0], patch);
+    assert.throws(() => parseProjectAccessStore(JSON.stringify(unsafe)));
+  }
+});
+
+test("repository metadata allows credential-free repository formats and rejects unsafe references", () => {
+  for (const repository of ["https://github.com/example/repo.git", "ssh://git@github.com/example/repo.git", "git@github.com:example/repo.git"]) {
+    assert.equal(saveProjectAccess(empty(), input({ repository }), {}, () => id).entries[0].repository, repository);
+  }
+  for (const repository of ["http://github.com/example/repo", "javascript:alert(1)", "file:///tmp/repo", "https://user:pass@github.com/example/repo", "https://git@github.com/example/repo", "https://github.com/example/repo?token=secret", "https://github.com/example/repo#secret", "ssh://git:secret@github.com/example/repo", "git@github.com:example/repo?token=x", "https://github.com/example/ghp_12345678901234567890", "https://github.com/example/repo\n", "x".repeat(2049)]) {
+    assert.throws(() => saveProjectAccess(empty(), input({ repository }), {}, () => id), undefined, repository);
+  }
+  for (const patch of [{ protocol: "http" }, { port: 0 }, { port: 65536 }, { port: 22.5 }, { port: "22" }, { repository: 123 }]) assert.throws(() => saveProjectAccess(empty(), input(patch), {}, () => id));
+  for (const repository of ["https://@github.com/example/repo", "https://:@github.com/example/repo", "ssh://git:@github.com/example/repo"]) assert.throws(() => saveProjectAccess(empty(), input({ repository }), {}, () => id));
+});
+
+test("connection resolver parses only supported addresses with exact card credentials", () => {
+  const password = "  exact\n'`$🔐  ";
+  for (const [protocol, address, host, port] of [
+    ["ssh", "my-ssh-alias", "my-ssh-alias", undefined], ["ssh", "server.example:2222", "server.example", 2222],
+    ["sftp", "sftp://server.example:2222/", "server.example", 2222], ["ftp", "ftp://server.example/", "server.example", undefined],
+    ["ssh", "[2001:db8::1]:2222", "2001:db8::1", 2222], ["ssh", "2001:db8::1", "2001:db8::1", undefined], ["ssh", "ssh://[2001:db8::1]:22", "2001:db8::1", 22],
+  ]) {
+    assert.deepEqual(resolveProjectAccessConnection(empty(), { protocol, values: { url: address, login: "alice", password } }), { connection: { host, user: "alice", protocol, ...(port === undefined ? {} : { port }) }, password });
+  }
+});
+
+test("connection patches preserve blanks, clear explicitly, and never borrow another card or API key", () => {
+  const store = saveProjectAccess(empty(), input({ values: { url: "own.example", login: "alice", password: "own-password", apiKey: "never-a-password" } }), {}, () => id);
+  assert.equal(resolveProjectAccessConnection(store, { id, protocol: "ssh", values: { url: "", login: "", password: "" } }).password, "own-password");
+  assert.equal(resolveProjectAccessConnection(store, { id, protocol: "ssh", clearFields: ["password"] }).password, "");
+  assert.equal(resolveProjectAccessConnection(store, { protocol: "ssh", values: { url: "new.example", login: "new-user" } }).password, "");
+  assert.throws(() => resolveProjectAccessConnection(store, { id: "87654321-1234-4234-8234-123456789abc", protocol: "ssh" }));
+  for (const clearFields of [["url"], ["login"]]) assert.throws(() => resolveProjectAccessConnection(store, { id, protocol: "ssh", clearFields }));
+  assert.equal(store.revision, 1); assert.equal(store.entries[0].values.password, "own-password");
+});
+
+test("connection resolver rejects ambiguous, credential-bearing, or unsupported input before probing", () => {
+  const resolve = (patch = {}) => resolveProjectAccessConnection(empty(), { protocol: "ssh", values: { url: "server.example", login: "alice" }, ...patch });
+  for (const url of ["https://server.example", "sftp://server.example", "ssh://alice:secret@server.example", "ssh://alice@server.example", "ssh://server.example/path", "ssh://server.example?secret", "ssh://server.example#secret", "server.example/path", " server.example", "server.example\n", "-oProxyCommand=x", "server.example:0", "server.example:65536", "[garbage]:22", "server.example:22:23", "ssh://server.example/%2f"]) assert.throws(() => resolve({ values: { url, login: "alice" } }), undefined, url);
+  for (const patch of [{ protocol: "https" }, { port: 0 }, { port: 1.5 }, { port: "22" }, { port: 2222, values: { url: "server.example:22", login: "alice" } }, { values: { url: "server.example", login: "-o" } }, { values: { url: "server.example" } }, { values: { url: "server.example", login: "alice", apiKey: "secret" } }, { clearFields: ["apiKey"] }, { values: null }, { unknown: true }]) assert.throws(() => resolve(patch));
+});
 
 test("cards store exact values and expose only status plus deterministic environment names", () => {
   const store = create();

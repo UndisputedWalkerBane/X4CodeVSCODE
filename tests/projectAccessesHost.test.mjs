@@ -20,7 +20,7 @@ await build({ entryPoints: [fileURLToPath(new URL("../src/ChatViewProvider.ts", 
       if (path === "vscode") return { contents: `import {rename} from "node:fs/promises";export const workspace={workspaceFolders:[],getConfiguration:(section)=>${h}.configuration(section),fs:{rename:async(source,destination)=>rename(source.fsPath,destination.fsPath),delete:async(uri)=>${h}.deleted.push(uri.fsPath)}};export const window={showWarningMessage:async()=>${h}.choices.shift(),showInformationMessage:async()=>{},showErrorMessage:(message)=>${h}.errors.push(message)};export const Uri={file:(fsPath)=>({fsPath})},commands={executeCommand:async()=>{}},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={};export class ThemeIcon{};` };
       if (path === "node:child_process") return { contents: 'export const spawn=()=>{throw new Error("unexpected external process")};' };
       if (path === "./journal") return { contents: 'export const readJournalContext=async()=>"";export const buildFinishPrompt=()=>"";' };
-      if (path === "./serverConnection") return { resolveDir: fileURLToPath(new URL("../src/", import.meta.url)), contents: `export {buildServerEnvironment,formatSshCommand} from ${JSON.stringify(fileURLToPath(new URL("../src/serverConnection.ts", import.meta.url)))};export const testServerConnection=async(connection,password)=>{${h}.serverTests.push({connection,password});return {ok:true,message:"fixture"};};` };
+      if (path === "./serverConnection") return { resolveDir: fileURLToPath(new URL("../src/", import.meta.url)), contents: `export {buildServerEnvironment,formatSshCommand} from ${JSON.stringify(fileURLToPath(new URL("../src/serverConnection.ts", import.meta.url)))};export const testServerConnection=async(connection,password)=>{${h}.serverTests.push({connection,password});return ${h}.probe ? await ${h}.probe(connection,password) : {ok:true,message:"fixture"};};` };
       if (path === "./remoteServer") return { contents: 'export class RemoteServer{};export const enableTailscaleFunnel=()=>{};export const generateToken=()=>"";export const lanAddresses=()=>[];export const tailscaleInfo=()=>{};' };
       if (path === "qrcode") return { contents: 'export const toString=()=>"";export default {};' };
       return { contents: 'export class ClaudeBackend{};export class CodexBackend{};export class CodexAppServerBackend{};export class CodexWriterRecoveryBackend{};export const codexDefaultModel=()=>"test-model";export const killAllCodex=()=>{};' };
@@ -55,8 +55,123 @@ function setup() {
   h.p = p; h.send = (msg, surface = "multi-panel", source = "vscode") => p.onMessage(msg, source, { send: message => h.messages.push(message) }, surface);
   h.request = (patch = {}) => ({ type: "saveProjectAccess", projectPath: projects[0].id, chatId: slots[0].chatId, requestId: "access-save-1", expectedRevision: 0, access: { name: " Database ", purpose: " Read reports ", values: { password: " fixture-secret\n`$'🔑 ", url: "fixture-private-url" } }, ...patch });
   h.responses = () => h.messages.filter(m => m.type === "projectAccesses");
+  h.probeRequest = (patch = {}) => ({ type: "testProjectAccess", projectPath: projects[0].id, chatId: slots[0].chatId, requestId: "probe-1", expectedRevision: 1, access: { id, protocol: "ssh", values: {} }, ...patch });
+  h.probeResponses = () => h.messages.filter(m => m.type === "projectAccessTestResult");
   return h;
 }
+
+function connectionStore() {
+  const store = JSON.parse(rawStore());
+  Object.assign(store.entries[0], { protocol: "ssh", port: 2222, repository: "https://github.com/example/repo" });
+  Object.assign(store.entries[0].values, { url: "protected-host.example", login: "card-user", apiKey: "card-api-never-password" });
+  return JSON.stringify(store);
+}
+
+test("card probe uses only selected-card credentials, leaves storage unchanged, and redacts diagnostics", async () => {
+  const h = setup(), raw = connectionStore(); h.secrets.set(cardsKey(h.projects[0].id), raw);
+  h.secrets.set(`agentHub.serverPassword:${h.projects[0].id}`, "primary-never-borrow");
+  h.secrets.set(`agentHub.secretEnv:${h.projects[0].id}`, JSON.stringify({ SSHPASS: "legacy-never-borrow" }));
+  h.probe = async () => ({ ok: true, message: "protected-host.example card-user fixture-secret card-api-never-password" });
+  await h.send(h.probeRequest({ access: { id, protocol: "ssh", port: 2222, values: { password: "" } } }));
+  assert.deepEqual(h.serverTests, [{ connection: { host: "protected-host.example", user: "card-user", protocol: "ssh", port: 2222 }, password: JSON.parse(raw).entries[0].values.password }]);
+  const response = h.probeResponses().at(-1);
+  assert.equal(response.ok, true); assert.equal(response.revision, 1); assert.equal(response.id, id); assert.equal(response.chatId, h.slots[0].chatId); assert.equal(response.projectPath, h.projects[0].id);
+  assert.match(response.message, /SSH.*парол/);
+  assert.equal(/protected-host|card-user|fixture-secret|card-api/.test(JSON.stringify(h.messages)), false);
+  assert.equal(h.secrets.get(cardsKey(h.projects[0].id)), raw); assert.deepEqual(h.writes, []);
+  assert.equal(h.reads.every(key => key === cardsKey(h.projects[0].id)), true);
+});
+
+test("unsaved check drafts need no card metadata and cleared passwords use explicit key mode", async () => {
+  for (const protocol of ["ssh", "sftp", "ftp"]) {
+    const h = setup();
+    await h.send(h.probeRequest({ expectedRevision: 0, access: { protocol, values: { url: "draft.example", login: "draft-user" } } }));
+    assert.equal(h.serverTests[0]?.password, ""); assert.equal(h.probeResponses().at(-1)?.ok, true); assert.equal(h.probeResponses().at(-1)?.id, undefined);
+    assert.equal(h.secrets.size, 0); assert.deepEqual(h.writes, []);
+    assert.match(h.probeResponses().at(-1).message, protocol === "ftp" ? /FTP.*корн/ : protocol === "sftp" ? /SFTP.*сесси/ : /SSH.*ключ/);
+  }
+  const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  await h.send(h.probeRequest({ access: { id, protocol: "ssh", clearFields: ["password"] } }));
+  assert.equal(h.serverTests[0].password, ""); assert.match(h.probeResponses().at(-1).message, /ключ/);
+});
+
+test("unknown cards, stale revisions, bad inputs and wrong sources reject before network calls", async () => {
+  const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  for (const patch of [{ expectedRevision: 0 }, { expectedRevision: "1" }, { requestId: "" }, { projectPath: h.projects[1].id }, { chatId: "chat-missing" }, { access: { id: "87654321-1234-4234-8234-123456789abc", protocol: "ssh" } }, { access: { id, protocol: "http" } }, { access: { id, protocol: "ssh", values: { apiKey: "forbidden" } } }, { access: null }]) {
+    await h.send(h.probeRequest(patch)); assert.equal(h.probeResponses().at(-1)?.ok, false);
+  }
+  assert.deepEqual(h.serverTests, []); assert.deepEqual(h.writes, []);
+  h.messages.length = 0; h.reads.length = 0;
+  await h.send(h.probeRequest({ chatId: undefined }), "view", "remote");
+  assert.deepEqual(h.probeResponses(), []); assert.deepEqual(h.reads, []);
+});
+
+test("probe exceptions and failed connection diagnostics never expose protected fields", async () => {
+  for (const throws of [false, true]) {
+    const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    h.probe = async () => { if (throws) throw new Error("protected-host.example card-user fixture-secret"); return { ok: false, message: "protected-host.example card-user fixture-secret" }; };
+    await h.send(h.probeRequest()); assert.equal(h.probeResponses().at(-1).ok, false);
+    assert.equal(/protected-host|card-user|fixture-secret/.test(JSON.stringify(h.messages)), false);
+  }
+});
+
+test("a project switch while the check snapshot is loading prevents network access", async () => {
+  const h = setup(), entered = gate(), release = gate(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.beforeGet = async () => { entered.resolve(); await release.promise; };
+  const pending = h.send(h.probeRequest()); await entered.promise;
+  await h.p.saveChatSlots([{ ...h.slots[0], projectPath: h.projects[1].id }, h.slots[1]]);
+  release.resolve(); await pending;
+  assert.deepEqual(h.serverTests, []); assert.equal(h.probeResponses().at(-1).ok, false); assert.deepEqual(h.writes, []);
+});
+
+test("completed or thrown checks release the pending guard for an explicit retry", async () => {
+  const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.probe = async () => { throw new Error("ignored protected error"); };
+  await h.send(h.probeRequest()); assert.equal(h.probeResponses().at(-1).ok, false);
+  h.probe = async () => ({ ok: true, message: "ignored" });
+  await h.send(h.probeRequest({ requestId: "retry" })); assert.equal(h.probeResponses().at(-1).ok, true); assert.equal(h.serverTests.length, 2);
+});
+
+test("pending checks guard duplicate requests per chat without blocking another profile save", async () => {
+  const h = setup(), entered = gate(), release = gate(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.probe = async () => { entered.resolve(); await release.promise; return { ok: true, message: "ignored" }; };
+  const pending = h.send(h.probeRequest()); await entered.promise;
+  await h.send(h.probeRequest({ requestId: "duplicate" }));
+  assert.equal(h.probeResponses().find(m => m.requestId === "duplicate").ok, false); assert.equal(h.serverTests.length, 1);
+  await h.send(h.request({ projectPath: h.projects[1].id, chatId: h.slots[1].chatId }));
+  assert.equal(h.responses().at(-1).revision, 1);
+  release.resolve(); await pending; assert.equal(h.probeResponses().find(m => m.requestId === "probe-1").ok, true);
+});
+
+test("revision changes, removed cards or switched project bindings make delayed successful checks stale", async () => {
+  for (const change of ["revision", "delete", "delete-same-revision", "binding"]) {
+    const h = setup(), entered = gate(), release = gate(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    h.probe = async () => { entered.resolve(); await release.promise; return { ok: true, message: "ignored" }; };
+    const pending = h.send(h.probeRequest()); await entered.promise;
+    if (change === "binding") await h.p.saveChatSlots([{ ...h.slots[0], projectPath: h.projects[1].id }, h.slots[1]]);
+    else { const updated = JSON.parse(connectionStore()); if (change !== "delete-same-revision") updated.revision++; if (change.startsWith("delete")) updated.entries = []; h.secrets.set(cardsKey(h.projects[0].id), JSON.stringify(updated)); }
+    release.resolve(); await pending;
+    assert.equal(h.probeResponses().at(-1).ok, false); assert.equal(h.probeResponses().at(-1).projectPath, h.projects[0].id);
+  }
+});
+
+test("local check results never broadcast remotely or to unrelated board surfaces", async () => {
+  const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  const remote = [], board = []; h.p.remote = { broadcast: message => remote.push(message) };
+  h.p.view = { webview: { postMessage: message => h.messages.push(message) } };
+  h.p.multiPanel = { webview: { postMessage: message => board.push(message) } };
+  h.p.post = ChatViewProvider.prototype.post.bind(h.p);
+  await h.send(h.probeRequest({ chatId: undefined }), "view");
+  assert.equal(h.probeResponses().at(-1).ok, true); assert.deepEqual(remote, []); assert.deepEqual(board, []);
+});
+
+test("each card's public repository and protocol metadata reach summaries and context only", async () => {
+  const h = setup();
+  await h.send(h.request({ access: { ...h.request().access, protocol: "sftp", port: 2222, repository: "https://github.com/example/card-repo" } }));
+  const summary = h.responses().at(-1).entries[0]; assert.equal(summary.protocol, "sftp"); assert.equal(summary.port, 2222); assert.equal(summary.repository, "https://github.com/example/card-repo");
+  const context = await h.p.buildProjectCard(h.projects[0]);
+  assert.match(context, /card-repo/); assert.match(context, /SFTP/); assert.match(context, /2222/); assert.equal(context.includes("fixture-secret"), false); assert.equal(context.includes("fixture-private-url"), false);
+});
 
 test("CRUD stores all card fields only in SecretStorage and public responses never contain values", async () => {
   const h = setup();

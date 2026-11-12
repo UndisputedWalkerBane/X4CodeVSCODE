@@ -329,7 +329,8 @@ body {
 }
 .project-access-purpose { font-size: 0.9em; white-space: pre-wrap; overflow-wrap: anywhere; }
 .project-access-values,
-.project-access-credentials { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.project-access-credentials,
+.project-access-connection-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .project-access-values > div { min-width: 0; }
 .project-access-values dt,
 .project-access-env dt { font-size: 0.8em; color: var(--vscode-descriptionForeground); }
@@ -339,7 +340,8 @@ body {
 .project-access-env dl { display: grid; gap: 6px; padding-top: 6px; }
 .project-access-field { display: flex; flex-direction: column; min-width: 0; gap: 4px; }
 .project-access-field > label { font-size: 0.9em; }
-.project-access-field input {
+.project-access-field input,
+.project-access-field select {
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
@@ -353,9 +355,12 @@ body {
 .project-access-clear,
 .project-accesses-retry { align-self: flex-start; font-size: 0.8em; }
 .project-access-error { color: var(--vscode-errorForeground); font-size: 0.85em; line-height: 1.45; overflow-wrap: anywhere; }
-.project-accesses :is(input, button, summary):focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
+.project-access-test-ok { color: var(--vscode-charts-green, #2ea043); font-size: 0.85em; line-height: 1.45; }
+.project-access-repository { font-size: 0.85em; overflow-wrap: anywhere; }
+.project-accesses :is(input, select, button, summary, a):focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 2px; }
 @container (max-width: 320px) {
-  .project-access-credentials { grid-template-columns: minmax(0, 1fr); }
+  .project-access-credentials,
+  .project-access-connection-options { grid-template-columns: minmax(0, 1fr); }
   .project-accesses-heading { align-items: flex-start; }
   .project-accesses-heading > .project-accesses-actions { width: 100%; }
 }

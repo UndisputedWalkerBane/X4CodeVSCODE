@@ -126,3 +126,15 @@ test("closing settings unmounts new secret drafts and reopening loads metadata a
 test("remote settings never mount the credential editor or request its metadata", () => {
   const h = setup({}, true); assert.equal(h.card(), undefined); assert.equal(commands.some(message => message.type === "getProjectAccesses"), false); h.dispose();
 });
+
+test("inline connection checks are chat scoped and never reset the separate settings drafts", () => {
+  const chatId = "access-check-chat"; const h = setup({ chatId, initialProjectPath: project.id, initialRecordId: "record-one" }); h.respond();
+  const serverPassword = () => nodes(h.tree).find(node => node.type === "input" && node.props.type === "password");
+  serverPassword().props.onChange({ target: { value: "fake-primary-check-password" } }); h.render();
+  h.click("Проверить доступ Metrics", true); const request = commands.at(-1);
+  assert.equal(request.type, "testProjectAccess"); assert.equal(request.chatId, chatId); assert.equal(request.projectPath, project.id);
+  const result = { type: "projectAccessTestResult", projectPath: project.id, requestId: request.requestId, revision: 1, id: summary.id, protocol: "ssh", ok: true, message: "Scoped fixture succeeded" };
+  h.deliver({ ...result, chatId: "other-chat" }); h.deliver(result); assert.equal(textOf(h.editor).includes(result.message), false);
+  h.deliver({ ...result, chatId }); assert.ok(textOf(h.editor).includes(result.message)); assert.equal(serverPassword().props.value, "fake-primary-check-password");
+  assert.equal(commands.some(message => ["saveSettings", "saveProjectAccess", "send", "steer"].includes(message.type)), false); h.dispose();
+});

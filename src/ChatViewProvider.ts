@@ -23,8 +23,8 @@ import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
-import { deleteProjectAccess, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
-import type { ProjectAccessSummary } from "./shared/projectAccesses";
+import { deleteProjectAccess, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, resolveProjectAccessConnection, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
+import type { ProjectAccessProtocol, ProjectAccessSummary } from "./shared/projectAccesses";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { CompactModeController } from "./compactMode";
@@ -84,6 +84,7 @@ const VSCODE_ONLY_ACTIONS = new Set<string>([
   "getProjectAccesses",
   "saveProjectAccess",
   "deleteProjectAccess",
+  "testProjectAccess",
 ]);
 
 function escapeHtml(s: string): string {
@@ -820,6 +821,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         respond(store, failure);
       }
     });
+  }
+
+  private pendingProjectAccessTests?: Map<string, symbol>;
+
+  /** Snapshot under the short storage queue; wait for the connection outside it. */
+  private async testProjectAccess(msg: Extract<WebviewToHost, { type: "testProjectAccess" }>, surface?: string): Promise<void> {
+    const validString = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !value.includes("\0");
+    const projectPath = validString(msg.projectPath, 4096) ? msg.projectPath : "";
+    const requestId = validString(msg.requestId, 160) ? msg.requestId : "";
+    const chatId = validString(msg.chatId, 160) ? msg.chatId : undefined;
+    const protocol: ProjectAccessProtocol = ["ssh", "sftp", "ftp"].includes(msg.access?.protocol) ? msg.access.protocol : "ssh";
+    const id = typeof msg.access?.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(msg.access.id) ? msg.access.id : undefined;
+    let revision = 0;
+    const respond = (ok: boolean, message: string) => {
+      const response: HostToWebview = { type: "projectAccessTestResult", projectPath, requestId, revision, protocol, ok, message,
+        ...(id ? { id } : {}), ...(chatId ? { chatId } : {}) };
+      if (surface === "multi-panel") this.multiPanel?.webview.postMessage(response);
+      else this.post(response);
+    };
+    const failure = `${protocol.toUpperCase()} — проверка не пройдена. Проверьте адрес, логин и способ авторизации.`;
+    const stale = `${protocol.toUpperCase()} — доступ или открытый проект изменился. Повторите проверку.`;
+    const binding = this.projectAccessBinding(projectPath, msg.chatId, surface);
+    if (!requestId || !binding || !Number.isSafeInteger(msg.expectedRevision) || msg.expectedRevision < 0 || msg.expectedRevision >= Number.MAX_SAFE_INTEGER) {
+      respond(false, failure); return;
+    }
+    const stillBound = () => {
+      const current = this.projectAccessBinding(projectPath, msg.chatId, surface);
+      return current?.key === binding.key && current.directory === binding.directory;
+    };
+    const pending = this.pendingProjectAccessTests ??= new Map();
+    const pendingKey = chatId ?? `${surface ?? "view"}:${projectPath}`;
+    if (pending.has(pendingKey)) { respond(false, `${protocol.toUpperCase()} — проверка уже выполняется. Дождитесь результата.`); return; }
+    const token = Symbol(); pending.set(pendingKey, token);
+    try {
+      const snapshot = await this.serializeProjectAccessWrite(async () => {
+        if (!stillBound()) throw new Error(stale);
+        const store = parseProjectAccessStore(await this.context.secrets.get(projectAccessesKey(binding.key)));
+        revision = store.revision;
+        if (!stillBound() || revision !== msg.expectedRevision) throw new Error(stale);
+        return resolveProjectAccessConnection(store, msg.access);
+      });
+      // No configuration, primary server password, environment aliases, or API key participates.
+      const result = await testServerConnection(snapshot.connection, snapshot.password);
+      const current = await this.serializeProjectAccessWrite(async () => {
+        if (!stillBound()) return false;
+        const store = parseProjectAccessStore(await this.context.secrets.get(projectAccessesKey(binding.key)));
+        revision = store.revision;
+        return stillBound() && revision === msg.expectedRevision && (!id || store.entries.some(entry => entry.id === id));
+      });
+      if (!current) { respond(false, stale); return; }
+      if (!result.ok) { respond(false, failure); return; }
+      const auth = snapshot.password ? "по паролю" : "по SSH-ключу";
+      const success = protocol === "ftp" ? "FTP — вход и чтение списка корневой папки подтверждены."
+        : protocol === "sftp" ? `SFTP — авторизованная сессия ${auth} подтверждена; запись файлов не проверялась.`
+        : `SSH — подключение ${auth} подтверждено.`;
+      respond(true, success);
+    } catch {
+      respond(false, failure);
+    } finally {
+      if (pending.get(pendingKey) === token) pending.delete(pendingKey);
+    }
   }
 
   /**
@@ -2208,6 +2270,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const mappings = (Object.keys(access.hasValues) as (keyof typeof access.hasValues)[])
         .filter(field => access.hasValues[field]).map(field => `${field}=$${access.envNames[field]}`);
       lines.push(`Доступ «${access.name}»${access.purpose ? `: ${access.purpose}` : ""}. Заданные поля: ${mappings.join(", ")}.`);
+      if (access.protocol) lines.push(`Протокол доступа: ${access.protocol.toUpperCase()}${access.port === undefined ? "" : `, порт ${access.port}`}.`);
+      else if (access.port !== undefined) lines.push(`Порт доступа: ${access.port}.`);
+      if (access.repository) lines.push(`Репозиторий этого доступа: ${access.repository}`);
     }
     if (entries.length) lines.push("Значения доступов бери только из окружения текущего процесса. Не выводи их в диалог, логи, файлы или аргументы команд.");
     return lines.join("\n");
@@ -4387,10 +4452,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const chatEvents = new Set([
       "projects", "transcript", "busy", "activity", "sessionInfo", "userMessage",
       "textDelta", "assistantText", "toolUse", "turnResult", "info", "error", "reset",
-      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled", "taskState", "messageEditPrepared", "editMessageResult", "attachmentAdded", "projectAccesses",
+      "permissionRequest", "permissionResolved", "contextUsage", "modelInfo", "effortInfo", "agentInfo", "draftHandled", "taskState", "messageEditPrepared", "editMessageResult", "attachmentAdded", "projectAccesses", "projectAccessTestResult",
     ]);
     if (!chatEvents.has(msg.type)) this.multiPanel?.webview.postMessage(msg);
-    if (msg.type !== "projectAccesses") this.remote?.broadcast(msg);
+    if (msg.type !== "projectAccesses" && msg.type !== "projectAccessTestResult") this.remote?.broadcast(msg);
   }
 
   /** Показать чат пользователю: вкладка приоритетнее сайдбара. */
@@ -4476,6 +4541,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     switch (msg.type) {
+      case "testProjectAccess":
+        await this.testProjectAccess(msg, surface);
+        break;
       case "getProjectAccesses":
       case "saveProjectAccess":
       case "deleteProjectAccess":
