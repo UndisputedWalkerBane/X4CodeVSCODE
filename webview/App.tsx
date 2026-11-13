@@ -170,6 +170,33 @@ interface AttachmentTarget {
   editing: boolean;
 }
 
+interface AttachmentUpload {
+  id: string;
+  target: AttachmentTarget;
+  originalPath?: string;
+  textDialogId?: string;
+}
+
+interface TextAttachmentDraft {
+  id: string;
+  target: AttachmentTarget;
+  text: string;
+  name: string;
+  uploadId?: string;
+  error?: string;
+}
+
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+// Keep the extensions aligned with the provider's image classification.
+const isImageAttachment = (path: string) => /\.(?:png|jpe?g|gif|webp|bmp)$/i.test(path);
+
+function addUploadedFiles(current: Attachment[], files: Attachment[], originalPath?: string): Attachment[] {
+  if (!originalPath) return [...current, ...files.filter(file => !current.some(existing => existing.path === file.path))];
+  const index = current.findIndex(file => file.path === originalPath);
+  if (index < 0 || !files[0]) return current;
+  return current.map((file, position) => position === index ? files[0] : file);
+}
+
 type ToolChipItem = Extract<ChatItem, { role: "tool" }>;
 
 /** Подряд идущие вызовы инструментов схлопываются в одну раскрываемую группу. */
@@ -315,6 +342,37 @@ function ChatTile({
   const [messageEditError, setMessageEditError] = useState<{ messageId: string; text: string } | null>(null);
   const normalAttachmentDraftRef = useRef(draftId());
   const filePickerTargetRef = useRef<AttachmentTarget | null>(null);
+  const imageReplacementRef = useRef<{ target: AttachmentTarget; originalPath: string } | null>(null);
+  const imageReplacementInputRef = useRef<HTMLInputElement>(null);
+  const [attachmentUploads, setAttachmentUploads] = useState<AttachmentUpload[]>([]);
+  const attachmentUploadsRef = useRef<AttachmentUpload[]>([]);
+  const updateAttachmentUploads = useCallback((uploads: AttachmentUpload[]) => {
+    attachmentUploadsRef.current = uploads;
+    setAttachmentUploads(uploads);
+  }, []);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [textAttachment, setTextAttachment] = useState<TextAttachmentDraft | null>(null);
+  const textAttachmentRef = useRef<TextAttachmentDraft | null>(null);
+  const textAttachmentDialogRef = useRef<HTMLDialogElement>(null);
+  const textAttachmentButtonRef = useRef<HTMLButtonElement>(null);
+  const updateTextAttachment = useCallback((draft: TextAttachmentDraft | null) => {
+    textAttachmentRef.current = draft;
+    setTextAttachment(draft);
+  }, []);
+  const finishAttachmentUpload = useCallback((uploadId: string, error?: string) => {
+    const upload = attachmentUploadsRef.current.find(entry => entry.id === uploadId);
+    if (!upload) return;
+    updateAttachmentUploads(attachmentUploadsRef.current.filter(entry => entry.id !== uploadId));
+    const edit = messageEditRef.current;
+    if (upload.target.editing && edit?.draftId === upload.target.context.draftId) {
+      updateMessageEdit({ ...edit, pendingUploads: edit.pendingUploads.filter(id => id !== uploadId),
+        ...(error ? { error } : {}) });
+    }
+    const draft = textAttachmentRef.current;
+    if (draft?.id === upload.textDialogId && draft?.uploadId === uploadId) {
+      updateTextAttachment(error ? { ...draft, uploadId: undefined, error } : null);
+    } else if (error && !upload.target.editing) setAttachmentError(error);
+  }, [updateAttachmentUploads, updateMessageEdit, updateTextAttachment]);
   const editTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [taskSnapshot, setTaskSnapshot] = useState<TaskSnapshot | null>(null);
   const taskSnapshotRef = useRef<TaskSnapshot | null>(null);
@@ -408,6 +466,12 @@ function ChatTile({
   const [configResult, setConfigResult] = useState<{ ok: boolean; message: string } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const feedRef = useRef<HTMLElement>(null);
+  const feedPositionsRef = useRef(new Map<string, { top: number; atBottom: boolean }>());
+  const feedPositionRef = useRef<{
+    key: string;
+    position: { top: number; atBottom: boolean };
+    restoring: boolean;
+  } | null>(null);
   /** Общий режим автопрокрутки: perProject | allOn | allOff. */
   const [autoScrollMode, setAutoScrollMode] = useState("perProject");
   /** Галочка автопрокрутки — своя у каждого проекта (по умолчанию включена). */
@@ -448,6 +512,10 @@ function ChatTile({
     if (previous.projectPath !== projectPath || previous.recordId !== recordId) {
       normalAttachmentDraftRef.current = draftId();
       filePickerTargetRef.current = null;
+      imageReplacementRef.current = null;
+      updateAttachmentUploads([]);
+      updateTextAttachment(null);
+      setAttachmentError(null);
       const edit = messageEditRef.current;
       if (edit && (edit.path !== projectPath || edit.sourceRecordId !== recordId)) {
         // A successful native fork is published before its acknowledgement.
@@ -458,7 +526,7 @@ function ChatTile({
       }
     }
     bindingRef.current = { projectPath, recordId };
-  }, [updateMessageEdit]);
+  }, [updateMessageEdit, updateAttachmentUploads, updateTextAttachment]);
 
   const editMatchesSource = useCallback((edit: MessageEditDraft) => {
     const binding = bindingRef.current;
@@ -469,6 +537,8 @@ function ChatTile({
   }, []);
 
   const cancelMessageEdit = useCallback((restoreFocus = true) => {
+    updateAttachmentUploads(attachmentUploadsRef.current.filter(upload => !upload.target.editing));
+    if (textAttachmentRef.current?.target.editing) updateTextAttachment(null);
     updateMessageEdit(null);
     setMessageEditError(null);
     filePickerTargetRef.current = null;
@@ -476,7 +546,7 @@ function ChatTile({
       const trigger = editTriggerRef.current;
       requestAnimationFrame(() => trigger?.isConnected ? trigger.focus() : composerRef.current?.focus());
     }
-  }, [updateMessageEdit]);
+  }, [updateMessageEdit, updateAttachmentUploads, updateTextAttachment]);
 
   // Производные значения активного проекта.
   const items = itemsByProject[activePath] ?? [];
@@ -493,6 +563,9 @@ function ChatTile({
   const editHintId = `message-edit-hint-${chatId ?? "main"}`;
   const sessionId = sessions[agent];
   const activeProject = projects.find((p) => projectKey(p) === activePath);
+  const currentAttachmentUploads = attachmentUploads.filter(upload =>
+    upload.target.path === activePath && upload.target.context.draftId ===
+      (messageEdit?.draftId ?? normalAttachmentDraftRef.current));
   const elapsed = busy && busyStartBy[activePath]
     ? Math.max(0, Math.floor((clock - busyStartBy[activePath]) / 1000))
     : 0;
@@ -914,27 +987,40 @@ function ChatTile({
         case "attachmentAdded": {
           const target = msg.path ?? activeRef.current;
           const context = msg.draftContext;
+          const upload = context?.uploadId ? attachmentUploadsRef.current.find(entry =>
+            entry.id === context.uploadId && entry.target.path === target &&
+            entry.target.context.draftId === context.draftId && entry.target.context.recordId === context.recordId) : undefined;
+          if (context?.uploadId && !upload) break;
           if (context) {
             const edit = messageEditRef.current;
             if (edit && context.draftId === edit.draftId) {
               if (edit.phase !== "ready" || context.recordId !== edit.sourceRecordId ||
                   target !== edit.path || !editMatchesSource(edit)) break;
-              updateMessageEdit({ ...edit, attachments: [...edit.attachments,
-                ...msg.files.filter((file) => !edit.attachments.some((existing) => existing.path === file.path))],
+              if (upload?.originalPath && (!msg.files[0] || !isImageAttachment(msg.files[0].path))) {
+                finishAttachmentUpload(upload.id, "Для замены выберите изображение PNG, JPEG, GIF, WebP или BMP.");
+                break;
+              }
+              updateMessageEdit({ ...edit, attachments: addUploadedFiles(edit.attachments, msg.files, upload?.originalPath),
                 missingAttachments: edit.missingAttachments.filter((name) => !msg.files.some((file) => file.name === name)),
                 pendingUploads: edit.pendingUploads.filter((uploadId) => uploadId !== context.uploadId) });
+              if (upload) finishAttachmentUpload(upload.id);
               break;
             }
             if (context.draftId !== normalAttachmentDraftRef.current || target !== activeRef.current ||
                 context.recordId !== bindingRef.current.recordId) break;
           } else if (messageEditRef.current || target !== activeRef.current) break;
+          if (upload?.originalPath && (!msg.files[0] || !isImageAttachment(msg.files[0].path))) {
+            finishAttachmentUpload(upload.id, "Для замены выберите изображение PNG, JPEG, GIF, WebP или BMP.");
+            break;
+          }
           setPendingBy((prev) => {
             const cur = prev[target] ?? [];
             return {
               ...prev,
-              [target]: [...cur, ...msg.files.filter((f) => !cur.some((x) => x.path === f.path))],
+              [target]: addUploadedFiles(cur, msg.files, upload?.originalPath),
             };
           });
+          if (upload) finishAttachmentUpload(upload.id);
           break;
         }
         case "userMessage":
@@ -987,6 +1073,10 @@ function ChatTile({
         case "error": {
           const context = msg.draftContext;
           if (context) {
+            const upload = context.uploadId ? attachmentUploadsRef.current.find(entry =>
+              entry.id === context.uploadId && entry.target.path === p &&
+              entry.target.context.draftId === context.draftId && entry.target.context.recordId === context.recordId) : undefined;
+            if (context.uploadId && !upload) break;
             const edit = messageEditRef.current;
             if (edit && context.draftId === edit.draftId) {
               if (edit.phase !== "ready" || context.recordId !== edit.sourceRecordId ||
@@ -995,10 +1085,15 @@ function ChatTile({
               updateMessageEdit({ ...edit,
                 pendingUploads: edit.pendingUploads.filter((uploadId) => uploadId !== context.uploadId),
                 error: msg.message });
+              if (upload) finishAttachmentUpload(upload.id, msg.message);
               break;
             }
             if (context.draftId !== normalAttachmentDraftRef.current || p !== activeRef.current ||
                 context.recordId !== bindingRef.current.recordId) break;
+            if (upload) {
+              finishAttachmentUpload(upload.id, msg.message);
+              break;
+            }
           }
           finalizeStreaming(p);
           mutateItems(p, (x) => [...x, { id: nextId++, role: "error", text: msg.message }]);
@@ -1040,7 +1135,7 @@ function ChatTile({
     post({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
   }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest,
-    updateTaskSnapshot, post, chatId, replaceBinding, updateMessageEdit, editMatchesSource]);
+    updateTaskSnapshot, post, chatId, replaceBinding, updateMessageEdit, editMatchesSource, finishAttachmentUpload]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
   // иначе фоновый стрим мог бы перезаписать только что переключённую сессию
@@ -1074,6 +1169,24 @@ function ChatTile({
         ? false
         : (autoScrollBy[activePath] ?? true);
 
+  // A menu replaces the feed DOM. Keep the reader's position in the tile, scoped
+  // to the exact conversation, rather than inheriting another project's offset.
+  const feedPositionKey = JSON.stringify([chatId, activePath, bindingRef.current.recordId]);
+  const attachFeed = useCallback((element: HTMLElement | null) => {
+    const previous = feedRef.current;
+    const state = feedPositionRef.current;
+    if (previous && state) {
+      if (!state.restoring) state.position.top = previous.scrollTop;
+      feedPositionsRef.current.set(state.key, { ...state.position });
+    }
+    feedRef.current = element;
+    feedPositionRef.current = element ? {
+      key: feedPositionKey,
+      position: { ...(feedPositionsRef.current.get(feedPositionKey) ?? { top: 0, atBottom: true }) },
+      restoring: true,
+    } : null;
+  }, [feedPositionKey]);
+
   useEffect(() => {
     try {
       localStorage.setItem("agentHub.autoScrollBy", JSON.stringify(autoScrollBy));
@@ -1085,23 +1198,55 @@ function ChatTile({
   /** Внизу ли лента (с запасом 60px) — для показа кнопки «к последнему». */
   const updateAtBottom = () => {
     const el = feedRef.current;
-    if (!el) return;
-    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 60);
+    const state = feedPositionRef.current;
+    if (!el || !state) return;
+    // A programmatic scroll event can arrive after the next content layout.
+    // Its unchanged target does not represent a new reading position or intent.
+    const clampedTop = Math.max(0, Math.min(state.position.top, el.scrollHeight - el.clientHeight));
+    if (Math.abs(el.scrollTop - clampedTop) < 1) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    state.position = { top: el.scrollTop, atBottom };
+    state.restoring = false;
+    feedPositionsRef.current.set(state.key, { ...state.position });
+    setAtBottom(atBottom);
   };
 
   const scrollFeedToBottom = useCallback(() => {
     const feed = feedRef.current;
-    feed?.scrollTo({ top: feed.scrollHeight, behavior: "smooth" });
+    const state = feedPositionRef.current;
+    if (feed && state) {
+      state.position = { top: Math.max(0, feed.scrollHeight - feed.clientHeight), atBottom: true };
+      state.restoring = false;
+    }
+    // An animated jump emits intermediate scroll positions that look like
+    // reader intent; a concurrent streaming update could stop it halfway.
+    if (feed) feed.scrollTop = feed.scrollHeight;
   }, []);
 
   useEffect(() => {
-    if (autoScrollOn) {
-      scrollFeedToBottom();
-    } else {
-      // Контент дорос без прокрутки — пересчитать, показывать ли кнопку ⇣.
-      updateAtBottom();
-    }
-  }, [items, activity, autoScrollOn, activePath, scrollFeedToBottom]);
+    const feed = feedRef.current;
+    const state = feedPositionRef.current;
+    if (!feed || !state || state.key !== feedPositionKey) return;
+    const restore = () => {
+      if (feedRef.current !== feed || feedPositionRef.current !== state) return;
+      const followBottom = autoScrollOn && state.position.atBottom;
+      feed.scrollTop = followBottom ? feed.scrollHeight : state.position.top;
+      state.restoring = !followBottom && feed.scrollTop + 1 < state.position.top;
+      if (followBottom) state.position.top = feed.scrollTop;
+      setAtBottom(feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60);
+    };
+    restore();
+    const frame = requestAnimationFrame(restore);
+    // Markdown, images and a previously hidden tile can acquire their final
+    // height after the first commit. Reapply the saved target as layout settles.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(restore);
+    observer?.observe(feed);
+    for (const child of feed.children) observer?.observe(child);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
+  }, [items, activity, autoScrollOn, feedPositionKey, settingsOpen, archiveOpen]);
 
   const answerPermission = (requestId: string, allow: boolean, answer?: string) => {
     // Карточка может лежать в любой ленте — обновляем во всех проектах.
@@ -1209,6 +1354,8 @@ function ChatTile({
       return;
     }
     if (pendingProjectRef.current || pendingAgentRef.current || pendingSessionRef.current || !agentReady) return;
+    if (attachmentUploadsRef.current.some(upload => !upload.target.editing &&
+        upload.target.context.draftId === normalAttachmentDraftRef.current)) return;
     const text = draft.trim();
     if (!text && pending.length === 0) return;
     const finalText = text || "Посмотри приложенные файлы.";
@@ -1256,28 +1403,39 @@ function ChatTile({
     return !!edit && edit.phase === "ready" && edit.draftId === target.context.draftId && editMatchesSource(edit);
   };
 
-  const ingestFiles = (files: FileList | File[], capturedTarget = captureAttachmentTarget()) => {
+  const ingestFiles = (files: FileList | File[], capturedTarget = captureAttachmentTarget(),
+    options: { originalPath?: string; textDialogId?: string } = {}) => {
     if (!capturedTarget || !attachmentTargetCurrent(capturedTarget)) return;
     const target = capturedTarget;
+    const reportError = (error: string) => {
+      const dialog = textAttachmentRef.current;
+      if (options.textDialogId && dialog?.id === options.textDialogId) updateTextAttachment({ ...dialog, error });
+      else if (target.editing && messageEditRef.current) updateMessageEdit({ ...messageEditRef.current, error });
+      else setAttachmentError(error);
+    };
     for (const file of Array.from(files)) {
-      if (file.size > 20 * 1024 * 1024) {
-        const error = `«${file.name}» больше 20 МБ — прикрепите через 📎.`;
-        const edit = messageEditRef.current;
-        if (target.editing && edit) updateMessageEdit({ ...edit, error });
-        else mutateItems(target.path, (p) => [
-          ...p,
-          { id: nextId++, role: "error", text: error },
-        ]);
+      if (options.originalPath && !isImageAttachment(file.name)) {
+        reportError("Для замены выберите изображение PNG, JPEG, GIF, WebP или BMP.");
         continue;
       }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        reportError(`«${file.name}» больше 20 МБ. Уменьшите размер вложения.`);
+        continue;
+      }
+      if (options.originalPath && attachmentUploadsRef.current.some(upload =>
+        upload.originalPath === options.originalPath && upload.target.context.draftId === target.context.draftId)) return;
       const name = file.name || "screenshot.png";
       const uploadId = draftId();
       const uploadTarget = { ...target, context: { ...target.context, uploadId } };
+      updateAttachmentUploads([...attachmentUploadsRef.current, { id: uploadId, target: uploadTarget, ...options }]);
+      setAttachmentError(null);
+      const dialog = textAttachmentRef.current;
+      if (options.textDialogId && dialog?.id === options.textDialogId) updateTextAttachment({ ...dialog, uploadId, error: undefined });
       const edit = messageEditRef.current;
-      if (target.editing && edit) updateMessageEdit({ ...edit, pendingUploads: [...edit.pendingUploads, uploadId] });
+      if (target.editing && edit) updateMessageEdit({ ...edit, pendingUploads: [...edit.pendingUploads, uploadId], error: undefined });
       const reader = new FileReader();
       reader.onload = () => {
-        if (!attachmentTargetCurrent(uploadTarget)) return;
+        if (!attachmentTargetCurrent(uploadTarget) || !attachmentUploadsRef.current.some(upload => upload.id === uploadId)) return;
         const dataUrl = reader.result as string;
         const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
         post({
@@ -1289,15 +1447,48 @@ function ChatTile({
         });
       };
       reader.onerror = () => {
-        const current = messageEditRef.current;
-        if (target.editing && current && attachmentTargetCurrent(uploadTarget) && current.pendingUploads.includes(uploadId)) {
-          updateMessageEdit({ ...current, pendingUploads: current.pendingUploads.filter((value) => value !== uploadId),
-            error: `Не удалось прочитать «${name}». Прикрепите файл ещё раз.` });
-        }
+        if (!attachmentTargetCurrent(uploadTarget)) return;
+        finishAttachmentUpload(uploadId, `Не удалось прочитать «${name}». Прикрепите файл ещё раз.`);
       };
-      reader.readAsDataURL(file);
+      reader.onabort = reader.onerror;
+      try { reader.readAsDataURL(file); }
+      catch { finishAttachmentUpload(uploadId, `Не удалось прочитать «${name}». Прикрепите файл ещё раз.`); }
     }
   };
+
+  const cancelTextAttachment = () => {
+    const uploadId = textAttachmentRef.current?.uploadId;
+    if (uploadId) finishAttachmentUpload(uploadId);
+    updateTextAttachment(null);
+  };
+
+  const saveTextAttachment = () => {
+    const dialog = textAttachmentRef.current;
+    if (!dialog || dialog.uploadId || !dialog.text.trim() || !attachmentTargetCurrent(dialog.target)) return;
+    const rawName = dialog.name.trim() || `text-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}`;
+    const name = /\.txt$/i.test(rawName) ? rawName : `${rawName}.txt`;
+    if (name.length > 255 || /[\\/\x00-\x1f]/.test(name)) {
+      updateTextAttachment({ ...dialog, error: "Введите имя файла без папок и управляющих символов (до 255 знаков)." });
+      return;
+    }
+    const file = new File([dialog.text], name, { type: "text/plain;charset=utf-8" });
+    ingestFiles([file], dialog.target, { textDialogId: dialog.id });
+  };
+
+  useEffect(() => {
+    const dialog = textAttachmentDialogRef.current;
+    if (!textAttachment || !dialog) return;
+    dialog.showModal();
+    return () => {
+      dialog.close();
+      textAttachmentButtonRef.current?.focus();
+    };
+  }, [!!textAttachment]);
+
+  useEffect(() => {
+    const dialog = textAttachmentRef.current;
+    if (dialog && (settingsOpen || archiveOpen || !attachmentTargetCurrent(dialog.target))) cancelTextAttachment();
+  }, [feedPositionKey, settingsOpen, archiveOpen, messageEdit?.draftId, messageEdit?.phase, agentReady, agentSwitching]);
 
   const onProjectChange = (value: string) => {
     if (value === "__add__") {
@@ -2212,7 +2403,7 @@ function ChatTile({
 
       {taskCard}
 
-      <main className="feed" ref={feedRef} onScroll={updateAtBottom}>
+      <main className="feed" ref={attachFeed} onScroll={updateAtBottom}>
         {items.length === 0 && (
           <div className="empty">
             Спросите что-нибудь — агент работает в папке выбранного проекта: читает
@@ -2472,7 +2663,8 @@ function ChatTile({
             <span className="message-edit-missing-hint">Прикрепите эти файлы заново или уберите их перед сохранением.</span>
           </div>
         ) : null}
-        {!!messageEdit?.pendingUploads.length && <div role="status">Добавляю вложения…</div>}
+        {attachmentError && <div className="message-edit-error" role="alert">{attachmentError}</div>}
+        {!!currentAttachmentUploads.length && <div role="status">Добавляю вложения…</div>}
         {queue.length > 0 && !messageEdit && (
           <div className="attach-row">
             {queue.map((q, i) => (
@@ -2519,7 +2711,21 @@ function ChatTile({
           <div className="attach-row">
             {pending.map((a) => (
               <span key={a.path} className="attach-chip" title={a.path}>
-                📎 {a.name}
+                📎 <button type="button" className="attach-name" aria-label={`Открыть ${a.name}`}
+                  onClick={() => post({ type: "openFile", path: a.path, project: activePath })}>{a.name}</button>
+                {isImageAttachment(a.path) && <>
+                  <button type="button" className="attach-action" aria-label={`Просмотр ${a.name}`}
+                    onClick={() => post({ type: "openFile", path: a.path, project: activePath })}>Просмотр</button>
+                  <button type="button" className="attach-action" aria-label={`Заменить ${a.name}`}
+                    disabled={busy || editFormDisabled || !agentReady || agentSwitching ||
+                      currentAttachmentUploads.some(upload => upload.originalPath === a.path)}
+                    onClick={() => {
+                      const target = captureAttachmentTarget();
+                      if (!target) return;
+                      imageReplacementRef.current = { target, originalPath: a.path };
+                      imageReplacementInputRef.current?.click();
+                    }}>Заменить</button>
+                </>}
                 <button
                   className="attach-remove"
                   title="Убрать вложение"
@@ -2604,6 +2810,16 @@ function ChatTile({
         />
         <div className="actions">
           <div className="actions-left">
+            <input ref={imageReplacementInputRef} type="file" hidden
+              accept=".png,.jpg,.jpeg,.gif,.webp,.bmp" aria-label="Выбрать замену изображения"
+              onChange={(e) => {
+                const replacement = imageReplacementRef.current;
+                imageReplacementRef.current = null;
+                const file = e.target.files?.[0];
+                if (replacement && file) ingestFiles([file], replacement.target, { originalPath: replacement.originalPath });
+                e.target.value = "";
+              }}
+            />
             <input
               ref={fileInputRef}
               type="file"
@@ -2632,6 +2848,13 @@ function ChatTile({
             >
               📎
             </button>
+            <button ref={textAttachmentButtonRef} type="button" className="attach-btn"
+              aria-label="Прикрепить текст" title="Сохранить большой текст отдельным файлом .txt и прикрепить к сообщению"
+              disabled={busy || editFormDisabled || !agentReady || agentSwitching}
+              onClick={() => {
+                const target = captureAttachmentTarget();
+                if (target) updateTextAttachment({ id: draftId(), target, text: "", name: "" });
+              }}>📄 Текст</button>
             <button
               className="attach-btn"
               hidden={REMOTE || !!messageEdit}
@@ -2706,7 +2929,7 @@ function ChatTile({
                       : "Сообщение отправится автоматически после ответа агента"
                 }
                 onClick={send}
-                disabled={!agentReady || agentSwitching || (!draft.trim() && pending.length === 0)}
+                disabled={!agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}
               >
                 {sendMode === "now" ? "⚡ Сразу" : sendMode === "next" ? "↪ Докинуть" : "⏳ В очередь"}
               </button>
@@ -2722,12 +2945,39 @@ function ChatTile({
               </button>
             </>
           ) : (
-            <button className="send" onClick={send} disabled={!agentReady || agentSwitching || (!draft.trim() && pending.length === 0)}>
+            <button className="send" onClick={send} disabled={!agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}>
               Отправить
             </button>
           )}
         </div>
       </footer>
+      {textAttachment && (
+        <dialog ref={textAttachmentDialogRef} className="text-attachment-dialog"
+          aria-labelledby={`text-attachment-title-${chatId ?? "main"}`}
+          onCancel={(event) => { event.preventDefault(); cancelTextAttachment(); }}>
+          <h2 id={`text-attachment-title-${chatId ?? "main"}`}>Текстовое вложение</h2>
+          <p>Текст сохранится отдельным файлом .txt и добавится к сообщению.</p>
+          <label>
+            Имя файла (необязательно)
+            <input aria-label="Имя текстового файла" value={textAttachment.name} maxLength={255}
+              placeholder="Заметки.txt" disabled={!!textAttachment.uploadId}
+              onChange={(event) => updateTextAttachment({ ...textAttachment, name: event.target.value, error: undefined })} />
+          </label>
+          <label>
+            Текст
+            <textarea aria-label="Текст вложения" autoFocus rows={14} value={textAttachment.text}
+              readOnly={!!textAttachment.uploadId}
+              onChange={(event) => updateTextAttachment({ ...textAttachment, text: event.target.value, error: undefined })} />
+          </label>
+          {textAttachment.error && <div className="message-edit-error" role="alert">{textAttachment.error}</div>}
+          {textAttachment.uploadId && <div role="status">Сохраняю вложение…</div>}
+          <div className="text-attachment-actions">
+            <button type="button" aria-label="Отмена текстового вложения" onClick={cancelTextAttachment}>Отмена</button>
+            <button type="button" aria-label="Сохранить текстовое вложение" className="text-attachment-save"
+              disabled={!textAttachment.text.trim() || !!textAttachment.uploadId} onClick={saveTextAttachment}>Сохранить</button>
+          </div>
+        </dialog>
+      )}
       {choice && (
         <div className="choice-backdrop" onClick={() => setChoice(null)}>
           <div className="choice-sheet" onClick={(e) => e.stopPropagation()}>

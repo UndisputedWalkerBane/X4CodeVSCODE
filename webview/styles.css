@@ -1018,6 +1018,108 @@ body.resizing-composer {
   opacity: 1;
 }
 
+.attach-name,
+.attach-action {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attach-action {
+  text-decoration: underline;
+  flex-shrink: 0;
+}
+
+.attach-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.attach-name:focus-visible,
+.attach-action:focus-visible,
+.text-attachment-dialog button:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.text-attachment-dialog {
+  width: min(640px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  box-sizing: border-box;
+  overflow: auto;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  padding: 16px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+}
+
+.text-attachment-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.text-attachment-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 1.15em;
+}
+
+.text-attachment-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 12px 0;
+}
+
+.text-attachment-dialog input,
+.text-attachment-dialog textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 7px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  font: inherit;
+}
+
+.text-attachment-dialog textarea {
+  min-height: 120px;
+  max-height: 55vh;
+  resize: vertical;
+}
+
+.text-attachment-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.text-attachment-actions button {
+  border: none;
+  border-radius: 3px;
+  padding: 6px 12px;
+  cursor: pointer;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+}
+
+.text-attachment-actions .text-attachment-save {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.text-attachment-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .queue-chip {
   background: var(--vscode-button-secondaryBackground);
   color: var(--vscode-button-secondaryForeground);
