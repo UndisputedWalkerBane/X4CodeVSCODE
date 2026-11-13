@@ -1,6 +1,7 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
+import { createLiveAccessBridge } from "../liveAccessEnvironment";
 import {
   CodexBackend,
   WRITER_CONFLICT_RE,
@@ -57,9 +58,53 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
+    if (!opts.liveAccess) { yield* this.startRun(prompt, opts); return; }
+    if (opts.signal.aborted) return;
+    if (process.platform === "win32") {
+      yield { kind: "notice", text: "Windows: обновление доступов в новых командах Codex/PowerShell во время хода пока не поддерживается; используются доступы на момент запуска." };
+      if (!opts.signal.aborted) yield* this.startRun(prompt, { ...opts, liveAccess: undefined });
+      return;
+    }
+    let bridge;
+    try { bridge = await createLiveAccessBridge(opts.liveAccess); }
+    catch {
+      yield { kind: "error", message: "Не удалось подготовить локальный канал доступов Codex. Запуск остановлен." };
+      yield { kind: "result", ok: false, durationMs: 0 };
+      return;
+    }
+    const children = new Set<ChildProcess>();
+    const exited = (child: ChildProcess) => child.exitCode !== null || child.signalCode != null;
+    try {
+      if (!opts.signal.aborted) yield* this.startRun(prompt, { ...opts, extraEnv: { ...opts.extraEnv, ...bridge.environment } }, children);
+    } finally {
+      // Setup before startAttempt's inner cleanup may also throw after spawning.
+      await Promise.all([...children].filter((child) => !exited(child)).map((child) => stopCodex(child)));
+      if ([...children].every(exited)) await bridge.dispose();
+      else {
+        // Failed process cleanup must keep the bootstrap until the last owned child exits.
+        let disposed = false;
+        const afterExit = () => {
+          if (disposed || ![...children].every(exited)) return;
+          disposed = true;
+          for (const child of children) {
+            child.removeListener("exit", afterExit);
+            child.removeListener("close", afterExit);
+          }
+          void bridge.dispose().catch(() => {});
+        };
+        for (const child of children) {
+          child.once("exit", afterExit);
+          child.once("close", afterExit);
+        }
+        afterExit();
+      }
+    }
+  }
+
+  private async *startRun(prompt: string, opts: StartOptions, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const startedAt = Date.now();
     try {
-      yield* this.startAttempt(prompt, opts, { kind: "initial", startedAt });
+      yield* this.startAttempt(prompt, opts, { kind: "initial", startedAt }, ownedChildren);
     } catch (err) {
       if (opts.signal.aborted) return;
       // startAttempt has confirmed its child stopped and finished all cleanup.
@@ -73,7 +118,7 @@ export class CodexAppServerBackend implements AgentBackend {
           if (opts.signal.aborted) return;
           yield* this.startAttempt(prompt, opts, {
             kind: "resumeRecovery", sourceSessionId: opts.resumeSessionId, startedAt,
-          });
+          }, ownedChildren);
           return;
         } catch (recoveryError) {
           if (opts.signal.aborted) return;
@@ -86,7 +131,7 @@ export class CodexAppServerBackend implements AgentBackend {
     }
   }
 
-  private async *startAttempt(prompt: string, opts: StartOptions, context: StartAttemptContext): AsyncIterable<AgentEvent> {
+  private async *startAttempt(prompt: string, opts: StartOptions, context: StartAttemptContext, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
     const sandbox = cfg.yolo ? "danger-full-access" : cfg.sandbox || "workspace-write";
     const startedAt = context.startedAt;
@@ -99,13 +144,14 @@ export class CodexAppServerBackend implements AgentBackend {
     }
     if (opts.signal.aborted) return;
 
-    const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    const child = spawn("codex", ["app-server", ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []), "--listen", "stdio://"], {
       cwd: opts.cwd,
       env: { ...process.env, ...(opts.extraEnv ?? {}) },
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
     });
+    ownedChildren?.add(child);
     trackCodexProcess(child);
     let childStopped = false;
     const stopOwnedChild = async () => {

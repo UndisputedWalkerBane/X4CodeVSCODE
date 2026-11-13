@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
+import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit, LiveAccessBridge } from "./types";
+import { createLiveAccessBridge } from "../liveAccessEnvironment";
 
 import { prepareClaudeEdit, verifiedClaudePath } from "./claudeNativeHistory";
 
@@ -64,8 +65,25 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
+    if (!opts.liveAccess) { yield* this.startQuery(prompt, opts); return; }
+    if (opts.signal.aborted) return;
+    let bridge: LiveAccessBridge;
+    try { bridge = await createLiveAccessBridge(opts.liveAccess); }
+    catch {
+      yield { kind: "error", message: "Не удалось подготовить локальный канал доступов Claude. Запуск остановлен." };
+      yield { kind: "result", ok: false, durationMs: 0 };
+      return;
+    }
+    try {
+      if (!opts.signal.aborted) yield* this.startQuery(prompt, { ...opts, extraEnv: { ...opts.extraEnv, ...bridge.environment } }, bridge);
+    } finally { await bridge.dispose(); }
+  }
+
+  private async *startQuery(prompt: string, opts: StartOptions, bridge?: LiveAccessBridge): AsyncIterable<AgentEvent> {
     const abortController = new AbortController();
-    opts.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+    const onAbort = () => abortController.abort();
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal.aborted) onAbort();
 
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
@@ -118,6 +136,18 @@ export class ClaudeBackend implements AgentBackend {
     // хук PostModelSwitch сообщает from/to и причину (auto = автофоллбэк).
     let anchorCaptured = false;
     options.hooks = {
+      ...(bridge ? {
+        PreToolUse: [{ matcher: "Bash", hooks: [async (input: unknown) => {
+          const event = input as { tool_name?: unknown; tool_input?: unknown };
+          if (event.tool_name !== "Bash" || !event.tool_input || typeof event.tool_input !== "object" || Array.isArray(event.tool_input)) return {};
+          const toolInput = event.tool_input as Record<string, unknown>;
+          if (typeof toolInput.command !== "string") return {};
+          return { hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            updatedInput: { ...toolInput, command: `${bridge.refreshCommand}\n${toolInput.command}` },
+          } };
+        }] }],
+      } : {}),
       UserPromptSubmit: [{ hooks: [async (input: unknown) => {
         const i = input as { prompt?: string; session_id?: string; transcript_path?: string; cwd?: string; source?: string };
         if (!anchorCaptured && opts.messageId && i.prompt === prompt && i.session_id && i.transcript_path && (!i.source || i.source === "sdk")) {
@@ -175,10 +205,7 @@ export class ClaudeBackend implements AgentBackend {
       };
     }
 
-    const stream = query({
-      prompt: input as unknown as Parameters<typeof query>[0]["prompt"],
-      options: options as Parameters<typeof query>[0]["options"],
-    });
+    let stream: ReturnType<typeof query> | undefined;
     /**
      * Занятость контекста = размер промпта ПОСЛЕДНЕГО запроса + его выход
      * (in + cache_read + cache_write + out одного API-вызова). Суммировать
@@ -195,6 +222,10 @@ export class ClaudeBackend implements AgentBackend {
           : inferClaudeWindow(currentModel);
 
     try {
+    stream = query({
+      prompt: input as unknown as Parameters<typeof query>[0]["prompt"],
+      options: options as Parameters<typeof query>[0]["options"],
+    });
     for await (const msg of stream) {
       while (pendingEvents.length > 0) yield pendingEvents.shift() as AgentEvent;
       // После result CLI начал новый ход по докинутому сообщению — ввод не закрываем.
@@ -441,6 +472,12 @@ export class ClaudeBackend implements AgentBackend {
       if (closeTimer) clearTimeout(closeTimer);
       input.close();
       if (opts.steer) opts.steer.handler = undefined;
+      opts.signal.removeEventListener("abort", onAbort);
+      // Query's iterator is separate from its process cleanup. return() awaits SDK teardown.
+      if (bridge) {
+        stream?.close?.();
+        await stream?.return?.(undefined);
+      }
     }
   }
 }

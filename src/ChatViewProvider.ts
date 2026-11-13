@@ -15,7 +15,8 @@ import type {
   SlashCommandInfo,
   WebviewToHost,
 } from "./shared/protocol";
-import type { AgentBackend, NativePromptAnchor, SteerChannel } from "./agents/types";
+import type { AgentBackend, LiveAccessChannel, NativePromptAnchor, SteerChannel } from "./agents/types";
+import { createLiveAccessChannel } from "./liveAccessEnvironment";
 import { ClaudeBackend } from "./agents/claudeBackend";
 import { CodexBackend, codexDefaultModel, killAllCodex } from "./agents/codexBackend";
 import { CodexAppServerBackend } from "./agents/codexAppServerBackend";
@@ -388,6 +389,17 @@ interface DeferredTurn {
   messageKind?: UserMessageKind;
 }
 
+interface LiveAccessRun {
+  projectPath: string;
+  controller: AbortController;
+  channel: LiveAccessChannel;
+  updatesSupported: boolean;
+  chatId?: string;
+  steer?: SteerChannel;
+  pendingNotification: boolean;
+  notificationTimer?: ReturnType<typeof setTimeout>;
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "agentHub.chat";
   static readonly multiViewId = "agentHub.multiChat";
@@ -426,6 +438,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private acknowledgedSessionForks = new Map<string, string>();
   /** Запущенные ходы: логический ключ профиля → контроллер. */
   private runs = new Map<string, AbortController>();
+  /** Each live channel belongs to one exact run, even when chats share a profile or cwd. */
+  private liveAccessRuns?: Map<string, LiveAccessRun>;
   /** Shared cwd runs are permitted; overlap disables unsafe pull/auto-Git. */
   private directoryRuns = new Map<string, DirectoryRunGroup>();
   private sessionWriters = new Map<string, AbortController>();
@@ -679,7 +693,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ];
 
     if (!sessionId) {
-      parts.push("", "### Карточка проекта", "", "```", await this.buildProjectCard(project), "```");
+      parts.push("", "### Карточка проекта", "", "```", await this.buildProjectCard(project, undefined, undefined, agent !== "codex" || process.platform !== "win32"), "```");
       const journal = await readJournalContext(
         project.path,
         journalDir,
@@ -768,12 +782,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Секретные переменные окружения проекта: {ИМЯ: значение}. */
-  private async getSecretEnv(projectPath: string): Promise<Record<string, string>> {
+  private async getSecretEnv(projectPath: string, strict = false): Promise<Record<string, string>> {
     try {
       const raw = await this.context.secrets.get(this.secretEnvKey(projectPath));
       const obj = raw ? (JSON.parse(raw) as Record<string, string>) : {};
-      return typeof obj === "object" && obj !== null ? obj : {};
+      if (typeof obj === "object" && obj !== null && !Array.isArray(obj) && Object.values(obj).every(value => typeof value === "string")) return obj;
+      if (strict) throw new Error("Invalid environment document");
+      return {};
     } catch {
+      if (strict) throw new Error("Не удалось прочитать доступы проекта. Проверьте защищённое хранилище.");
       return {};
     }
   }
@@ -790,7 +807,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async getAgentAccessSnapshot(projectPath: string): Promise<{ environment: Record<string, string>; entries: ProjectAccessSummary[] }> {
     try {
       const [legacy, raw] = await Promise.all([
-        this.getSecretEnv(projectPath), this.context.secrets.get(projectAccessesKey(projectPath)),
+        this.getSecretEnv(projectPath, true), this.context.secrets.get(projectAccessesKey(projectPath)),
       ]);
       const store = parseProjectAccessStore(raw);
       return { environment: mergeProjectAccessEnvironment(legacy, store), entries: summarizeProjectAccesses(store) };
@@ -801,6 +818,95 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async getAgentEnvironment(projectPath: string): Promise<Record<string, string>> {
     return (await this.getAgentAccessSnapshot(projectPath)).environment;
+  }
+
+  /** Only public names and purpose labels enter the manifest and live steering messages. */
+  private liveAccessContext(environment: Readonly<Record<string, string>>, entries: ProjectAccessSummary[]): string {
+    const lines = [`Переменные окружения проекта: ${Object.keys(environment).sort().join(", ") || "не заданы"}.`];
+    lines.push(environment.AGENT_HUB_SERVER_PASSWORD
+      ? "Пароль сервера доступен через SSHPASS, AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD."
+      : "Пароль сервера не задан; SSHPASS, AGENT_HUB_SERVER_PASSWORD и LFTP_PASSWORD пусты.");
+    for (const access of entries) {
+      const mappings = (Object.keys(access.hasValues) as (keyof typeof access.hasValues)[])
+        .filter(field => access.hasValues[field]).map(field => `${field}=$${access.envNames[field]}`);
+      lines.push(`Доступ «${access.name}»${access.purpose ? `: ${access.purpose}` : ""}. Заданные поля: ${mappings.join(", ") || "нет"}.`);
+    }
+    lines.push("Используй значения из окружения новой команды; удалённые переменные больше недоступны. Не выводи значения в диалог, логи, файлы или аргументы команд.");
+    return lines.join("\n");
+  }
+
+  /** Caller holds the credential queue, so cards, legacy env and password form one revision. */
+  private async readLiveAccessSnapshot(projectPath: string) {
+    try {
+      const snapshot = await this.getAgentAccessSnapshot(projectPath);
+      const environment = buildServerEnvironment(snapshot.environment, await this.context.secrets.get(this.passwordKey(projectPath)));
+      return { environment, entries: snapshot.entries, publicContext: this.liveAccessContext(environment, snapshot.entries) };
+    } catch {
+      throw new Error("Не удалось прочитать доступы проекта. Проверьте защищённое хранилище.");
+    }
+  }
+
+  private isLiveAccessRun(runKey: string, binding: LiveAccessRun): boolean {
+    return !binding.controller.signal.aborted && this.runs.get(runKey) === binding.controller && this.liveAccessRuns?.get(runKey) === binding;
+  }
+
+  private queueLiveAccessNotification(runKey: string, binding: LiveAccessRun) {
+    if (!binding.updatesSupported || !binding.pendingNotification || binding.notificationTimer || !binding.steer?.handler || !this.isLiveAccessRun(runKey, binding)) return;
+    // Coalesce closely spaced edits. Backends without live steering keep using the public manifest.
+    binding.notificationTimer = setTimeout(() => {
+      binding.notificationTimer = undefined;
+      if (!this.isLiveAccessRun(runKey, binding) || !binding.pendingNotification || !binding.steer?.handler) return;
+      binding.pendingNotification = false;
+      void binding.steer.handler(`Доступы проекта изменены. Актуальная схема:\n${binding.channel.publicContext ?? ""}`, "next").catch(() => {
+        if (this.isLiveAccessRun(runKey, binding)) this.postScoped(binding.projectPath,
+          { type: "error", message: "Доступы сохранены и окружение обновлено; уведомление работающему агенту не доставлено." }, binding.chatId);
+      });
+    }, 20);
+  }
+
+  /** Publish only after durable storage. Delivery failures never imply that persistence was rolled back. */
+  private async publishLiveAccess(projectPath: string): Promise<boolean> {
+    const bindings = [...(this.liveAccessRuns ?? [])].filter(([runKey, binding]) => binding.updatesSupported && binding.projectPath === projectPath && this.isLiveAccessRun(runKey, binding));
+    if (!bindings.length) return true;
+    const failure = "Доступы сохранены, но не удалось обновить окружение всех работающих агентов. Повторите сохранение.";
+    let snapshot: Awaited<ReturnType<ChatViewProvider["readLiveAccessSnapshot"]>>;
+    try { snapshot = await this.readLiveAccessSnapshot(projectPath); }
+    catch {
+      for (const [runKey, binding] of bindings) if (this.isLiveAccessRun(runKey, binding)) this.postScoped(projectPath, { type: "error", message: failure }, binding.chatId);
+      return false;
+    }
+    const results = await Promise.all(bindings.map(async ([runKey, binding]) => {
+      if (!this.isLiveAccessRun(runKey, binding)) return true;
+      try {
+        await binding.channel.update(snapshot.environment, snapshot.publicContext);
+        if (this.isLiveAccessRun(runKey, binding)) {
+          binding.pendingNotification = true;
+          this.queueLiveAccessNotification(runKey, binding);
+        }
+        return true;
+      } catch {
+        if (this.isLiveAccessRun(runKey, binding)) this.postScoped(projectPath, { type: "error", message: failure }, binding.chatId);
+        return false;
+      }
+    }));
+    return results.every(Boolean);
+  }
+
+  private saveCredentialChange(projectPath: string, operation: () => PromiseLike<void>): Promise<boolean> {
+    return this.serializeProjectAccessWrite(async () => {
+      try { await operation(); }
+      catch { throw new Error("Не удалось сохранить доступы проекта. Проверьте защищённое хранилище."); }
+      return this.publishLiveAccess(projectPath);
+    });
+  }
+
+  /** Reuse the channel's input contract before credentials can poison durable storage. */
+  private secretEnvInputError(pairs: Record<string, string>): string | undefined {
+    try { createLiveAccessChannel(pairs); return undefined; }
+    catch {
+      return "Доступы не сохранены. BASH_ENV, ZDOTDIR, имена AGENT_HUB_LIVE_* и встроенные переменные оболочки (например UID и SHELLOPTS) зарезервированы. " +
+        "Используйте латинские буквы, цифры и _; имя не должно начинаться с цифры. Значения не должны содержать нулевой символ.";
+    }
   }
 
   private projectAccessBinding(projectPath: string, chatId: string | undefined, surface?: string) {
@@ -847,8 +953,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!stillBound()) throw new Error(failure);
         const next = msg.type === "saveProjectAccess" ? saveProjectAccess(store, msg.access, legacy) : deleteProjectAccess(store, msg.id);
         await this.context.secrets.store(projectAccessesKey(binding.key), JSON.stringify(next));
+        const delivered = await this.publishLiveAccess(binding.key);
         // A view may switch while persistence is in flight. Its response retains the original address.
-        respond(next, stillBound() ? undefined : failure);
+        respond(next, !delivered ? "Доступы сохранены, но не удалось обновить окружение работающих агентов. Повторите сохранение." : stillBound() ? undefined : failure);
       } catch {
         respond(store, failure);
       }
@@ -2060,14 +2167,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     if (password === undefined) return;
 
+    const delivered = await this.saveCredentialChange(pick.path, () => this.context.secrets.store(this.passwordKey(pick.path), password));
     if (password) {
-      await this.context.secrets.store(this.passwordKey(pick.path), password);
       void vscode.window.showInformationMessage("Пароль сохранён в защищённом хранилище.");
     } else {
       // Empty override also suppresses older password aliases in project env.
-      await this.context.secrets.store(this.passwordKey(pick.path), "");
       void vscode.window.showInformationMessage("Сохранённый пароль удалён.");
     }
+    if (!delivered) void vscode.window.showErrorMessage("Пароль сохранён, но не удалось обновить окружение работающих агентов. Повторите сохранение.");
   }
 
   /**
@@ -2123,8 +2230,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       if (!picked) return;
       if ("removed" in picked) {
-        delete env[picked.removed];
-        await this.context.secrets.store(key, JSON.stringify(env));
+        await this.saveCredentialChange(projectKey(project), async () => {
+          const latest = await this.getSecretEnv(projectKey(project), true);
+          delete latest[picked.removed];
+          await this.context.secrets.store(key, JSON.stringify(latest));
+        });
         await this.postSettings(chatId);
         continue;
       }
@@ -2135,23 +2245,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             prompt: "Имя переменной окружения (латиница, цифры, _)",
             placeHolder: "например: DB_PASSWORD, API_KEY, SSH_LOGIN",
             ignoreFocusOut: true,
-            validateInput: (v) =>
-              /^[A-Za-z_][A-Za-z0-9_]*$/.test(v.trim())
-                ? undefined
-                : "Только латиница, цифры и _, не с цифры",
+            validateInput: (v) => this.secretEnvInputError({ [v.trim()]: "" }),
           })
         )?.trim();
         if (!name) continue;
       }
       if (!name) continue;
+      const nameError = this.secretEnvInputError({ [name]: "" });
+      if (nameError) { void vscode.window.showErrorMessage(nameError); continue; }
       const value = await vscode.window.showInputBox({
         prompt: `Значение ${name} (пусто — отмена). Хранится в защищённом хранилище, в чат не выводится`,
         password: true,
         ignoreFocusOut: true,
       });
       if (!value) continue;
-      env[name] = value;
-      await this.context.secrets.store(key, JSON.stringify(env));
+      const valueError = this.secretEnvInputError({ [name]: value });
+      if (valueError) { void vscode.window.showErrorMessage(valueError); continue; }
+      const envName = name;
+      await this.saveCredentialChange(projectKey(project), async () => {
+        const latest = await this.getSecretEnv(projectKey(project), true);
+        latest[envName] = value;
+        await this.context.secrets.store(key, JSON.stringify(latest));
+      });
       await this.postSettings(chatId);
     }
   }
@@ -2194,6 +2309,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
+    const inputError = this.secretEnvInputError(pairs);
+    if (inputError) { post({ type: "error", message: inputError }); return; }
 
     const projects = this.getProjects();
     if (projects.length === 0) {
@@ -2217,9 +2334,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     for (const p of picked) {
       // Picker rows carry the logical key in their path field.
-      const env = await this.getSecretEnv(p.path);
-      Object.assign(env, pairs);
-      await this.context.secrets.store(this.secretEnvKey(p.path), JSON.stringify(env));
+      await this.saveCredentialChange(p.path, async () => {
+        const env = await this.getSecretEnv(p.path, true);
+        Object.assign(env, pairs);
+        await this.context.secrets.store(this.secretEnvKey(p.path), JSON.stringify(env));
+      });
     }
     await this.postSettings(chatId);
     // Поле ввода можно очищать только после успешного сохранения.
@@ -2235,7 +2354,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Актуальные настройки проекта; значения секретов в контекст не попадают. */
-  private async buildProjectCard(p: ProjectInfo, serverEnv?: Record<string, string>, accesses?: ProjectAccessSummary[]): Promise<string> {
+  private async buildProjectCard(p: ProjectInfo, serverEnv?: Record<string, string>, accesses?: ProjectAccessSummary[], liveUpdates = true): Promise<string> {
     const lines = [`Ты работаешь над проектом «${p.name}».`, `Рабочая папка: ${p.path}`];
     if (p.githubRepo) lines.push(`GitHub-репозиторий проекта: ${p.githubRepo}`);
     if (p.branch) {
@@ -2290,7 +2409,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     if (p.server) lines.push(`Заметки о сервере: ${p.server}`);
-    const envNames = Object.keys(await this.getSecretEnv(projectKey(p))).sort();
+    const envNames = Object.keys(serverEnv ?? await this.getSecretEnv(projectKey(p)))
+      .filter(name => !name.startsWith("AGENT_HUB_ACCESS_")).sort();
     if (envNames.length > 0) {
       lines.push(
         `Доступы проекта заданы в переменных окружения: ${envNames.join(", ")}. ` +
@@ -2307,6 +2427,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (access.repository) lines.push(`Репозиторий этого доступа: ${access.repository}`);
     }
     if (entries.length) lines.push("Значения доступов бери только из окружения текущего процесса. Не выводи их в диалог, логи, файлы или аргументы команд.");
+    if (liveUpdates) lines.push("Доступы могут изменяться во время хода. Перед использованием проверь актуальную схему в публичном файле по пути из AGENT_HUB_LIVE_CONTEXT; файл содержит только имена и назначение, значения доступны в окружении каждой новой команды.");
+    else lines.push("Доступы этого хода зафиксированы на момент запуска. Сохранённые во время хода изменения будут доступны со следующим запуском.");
     return lines.join("\n");
   }
 
@@ -3606,12 +3728,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await cfg.update("projects", list, g);
 
       if (s.newPassword !== undefined) {
-        if (s.newPassword) {
-          await this.context.secrets.store(this.passwordKey(configuredProjectKey(s.project)), s.newPassword);
-        } else {
-          // Preserve the explicit removal across turns instead of reviving an env alias.
-          await this.context.secrets.store(this.passwordKey(configuredProjectKey(s.project)), "");
-        }
+        const projectPath = configuredProjectKey(s.project), password = s.newPassword;
+        // Preserve explicit removal across turns instead of reviving an env alias.
+        await this.saveCredentialChange(projectPath, () => this.context.secrets.store(this.passwordKey(projectPath), password));
       }
     }
 
@@ -5342,6 +5461,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     group.controllers.add(controller);
     directoryRuns.set(directory, group);
     this.runs.set(runKey, controller);
+    // Register before the first await: saves during startup must reach this exact future backend.
+    const liveAccess: LiveAccessRun = { projectPath: cwd, controller, channel: createLiveAccessChannel(),
+      updatesSupported: agent !== "codex" || process.platform !== "win32", chatId, pendingNotification: false };
+    const liveAccessRuns = this.liveAccessRuns ??= new Map();
+    liveAccessRuns.set(runKey, liveAccess);
+    const releaseLiveAccess = () => {
+      if (liveAccess.notificationTimer) clearTimeout(liveAccess.notificationTimer);
+      liveAccess.notificationTimer = undefined;
+      liveAccess.pendingNotification = false;
+      if (liveAccessRuns.get(runKey) === liveAccess) liveAccessRuns.delete(runKey);
+      controller.signal.removeEventListener("abort", releaseLiveAccess);
+    };
+    controller.signal.addEventListener("abort", releaseLiveAccess, { once: true });
     const releaseDirectory = () => {
       const current = directoryRuns.get(directory);
       current?.controllers.delete(controller);
@@ -5456,13 +5588,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     // Один снимок секретов для карточки и процесса, включая resumed-сессии.
-    const accessSnapshot = await this.getAgentAccessSnapshot(projectKey(project));
-    const serverEnv = buildServerEnvironment(
-      accessSnapshot.environment,
-      await this.context.secrets.get(this.passwordKey(projectKey(project))),
-    );
+    const accessSnapshot = await this.serializeProjectAccessWrite(async () => {
+      const snapshot = await this.readLiveAccessSnapshot(cwd);
+      if (this.isLiveAccessRun(runKey, liveAccess)) await liveAccess.channel.update(snapshot.environment, snapshot.publicContext);
+      return snapshot;
+    });
+    const serverEnv = accessSnapshot.environment;
     if (discardStaleQuestion()) return;
-    const projectCard = isSlashCommand ? "" : await this.buildProjectCard(project, serverEnv, accessSnapshot.entries);
+    if (!this.isLiveAccessRun(runKey, liveAccess)) return;
+    const projectCard = isSlashCommand ? "" : await this.buildProjectCard(project, serverEnv, accessSnapshot.entries, liveAccess.updatesSupported);
     if (discardStaleQuestion()) return;
     let fullPrompt = promptWithAttachments;
     if (!sessions[agent] && !isSlashCommand) {
@@ -5538,6 +5672,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           attachments: attachments.length ? attachments.map((a) => a.name) : undefined,
         });
       }
+      if (!this.isLiveAccessRun(runKey, liveAccess)) return;
       questionPreparation = false;
       const backend =
         agent === "codex" &&
@@ -5547,6 +5682,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           : this.backends[agent];
       const steer: SteerChannel = {};
       this.steers.set(runKey, steer);
+      liveAccess.steer = steer;
       const events = backend.start(fullPrompt, {
         messageId,
         cwd: workingDir,
@@ -5555,7 +5691,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         steer,
         refreshModels: agent === "claude" && this.claudeModelsStale(),
         cliPath: agent === "claude" ? this.resolveClaudeCli() : undefined,
-        extraEnv: serverEnv,
+        extraEnv: { ...liveAccess.channel.current },
+        liveAccess: liveAccess.channel,
         config: this.buildAgentConfig(agent, record.modelOverrides?.[agent], record.effortOverrides?.[agent]),
         attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd, chatId, record.id),
@@ -5566,6 +5703,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // исключениями: сбой CLI до старта треда не должен помечать контекст
       // «увиденным» — иначе другой агент потеряет эти сообщения навсегда.
       for await (const ev of events) {
+        this.queueLiveAccessNotification(runKey, liveAccess);
         switch (ev.kind) {
           case "nativePrompt":
             if (messageKind === "prompt" && messageId && ev.messageId === messageId && ev.anchor.provider === agent) await mutateTurnRecord(r => {
@@ -5759,7 +5897,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         emit({ type: "info", text: "Остановлено." });
       }
     } finally {
-      this.steers.delete(runKey);
+      releaseLiveAccess();
+      if (this.steers.get(runKey) === liveAccess.steer) this.steers.delete(runKey);
       const steered = [...(this.steerTexts.get(runKey) ?? []), ...questionAnswers];
       this.steerTexts.delete(runKey);
       // Общий лог беседы — зеркало видимой ленты. Отметку «видел до сих пор»
@@ -5815,7 +5954,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       releaseWriter();
       await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin, nextDeferred.chatId, false, nextDeferred.messageKind);
     }
+    } catch {
+      if (!controller.signal.aborted) emit({ type: "error", message: "Не удалось подготовить запуск агента. Проверьте доступы проекта и защищённое хранилище." });
     } finally {
+      releaseLiveAccess();
       releaseWriter();
       releaseDirectory();
       if (this.runs.get(runKey) === controller) {

@@ -105,6 +105,26 @@ export interface SteerChannel {
   handler?: (text: string, mode: "now" | "next") => Promise<void>;
 }
 
+/** Host-only full snapshots. Values must never be copied into prompts or tool arguments. */
+export interface LiveAccessChannel {
+  readonly current: Readonly<Record<string, string>>;
+  readonly revision: number;
+  readonly publicContext: string | undefined;
+  /** Every environment name owned by this run, including names since removed. */
+  readonly ownedKeys: readonly string[];
+  /** Commits before notifying subscribers; a delivery failure rejects without rolling back. */
+  update(next: Record<string, string>, publicContext?: string): Promise<void>;
+  subscribe(listener: (snapshot: Readonly<Record<string, string>>, revision: number) => void | Promise<void>): () => void;
+}
+
+/** Per-run encrypted snapshot shell bootstrap. Environment and command contain metadata only. */
+export interface LiveAccessBridge {
+  readonly environment: Record<string, string>;
+  readonly refreshCommand: string;
+  readonly contextPath: string;
+  dispose(): Promise<void>;
+}
+
 export interface StartOptions {
   /** Stable host user-message ID (UUID for Claude streamed input). */
   messageId?: string;
@@ -114,6 +134,8 @@ export interface StartOptions {
   resumeSessionId?: string;
   /** Дополнительные переменные окружения (например, пароль сервера из SecretStorage). */
   extraEnv?: Record<string, string>;
+  /** Host-owned live access snapshots, isolated by logical project and active run. */
+  liveAccess?: LiveAccessChannel;
   /** Настройки модели/поведения агента. */
   config: AgentRunConfig;
   /** Абсолютные пути приложенных файлов (изображения Codex получает через -i). */

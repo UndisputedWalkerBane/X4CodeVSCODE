@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions } from "./types";
+import { createLiveAccessBridge } from "../liveAccessEnvironment";
 
 /**
  * Живые процессы codex по id треда. Codex держит flock треда, пока процесс
@@ -137,6 +138,54 @@ export function killStaleCodex(key: string): boolean {
   }
   killGroup(stale, "SIGKILL");
   return true;
+}
+
+/** One bridge spans startup retries; its files outlive every native child using them. */
+async function* withCodexLiveAccess(
+  opts: StartOptions,
+  run: (options: StartOptions, ownedChildren?: Set<ChildProcess>) => AsyncIterable<AgentEvent>,
+): AsyncIterable<AgentEvent> {
+  if (!opts.liveAccess) { yield* run(opts); return; }
+  if (opts.signal.aborted) return;
+  if (process.platform === "win32") {
+    yield { kind: "notice", text: "Windows: обновление доступов в новых командах Codex/PowerShell во время хода пока не поддерживается; используются доступы на момент запуска." };
+    if (!opts.signal.aborted) yield* run({ ...opts, liveAccess: undefined });
+    return;
+  }
+  let bridge;
+  try { bridge = await createLiveAccessBridge(opts.liveAccess); }
+  catch {
+    yield { kind: "error", message: "Не удалось подготовить локальный канал доступов Codex. Запуск остановлен." };
+    yield { kind: "result", ok: false, durationMs: 0 };
+    return;
+  }
+  const children = new Set<ChildProcess>();
+  try {
+    if (!opts.signal.aborted) yield* run({ ...opts, extraEnv: { ...opts.extraEnv, ...bridge.environment } }, children);
+  } finally {
+    // Also covers synchronous setup errors before the inner generator's cleanup scope.
+    await Promise.all([...children].filter((child) => !hasExited(child)).map((child) => stopCodex(child)));
+    if ([...children].every(hasExited)) await bridge.dispose();
+    else {
+      // A failed TERM/KILL must not remove a still-running child's bootstrap.
+      // Its eventual exit owns deferred cleanup; another run cannot borrow it.
+      let disposed = false;
+      const afterExit = () => {
+        if (disposed || ![...children].every(hasExited)) return;
+        disposed = true;
+        for (const child of children) {
+          child.removeListener("exit", afterExit);
+          child.removeListener("close", afterExit);
+        }
+        void bridge.dispose().catch(() => {});
+      };
+      for (const child of children) {
+        child.once("exit", afterExit);
+        child.once("close", afterExit);
+      }
+      afterExit();
+    }
+  }
 }
 
 export const WRITER_CONFLICT_RE = /already has an active writer|thread-store conflict/i;
@@ -294,6 +343,10 @@ export class CodexBackend implements AgentBackend {
   readonly id = "codex";
 
   async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
+    yield* withCodexLiveAccess(opts, (options, children) => this.startProcess(prompt, options, children));
+  }
+
+  private async *startProcess(prompt: string, opts: StartOptions, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
     const sandbox = cfg.sandbox || "workspace-write";
     const modelFlags = [
@@ -314,6 +367,7 @@ export class CodexBackend implements AgentBackend {
     const args = opts.resumeSessionId
       ? [
           "exec",
+          ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []),
           "resume",
           "--json",
           "--skip-git-repo-check",
@@ -325,6 +379,7 @@ export class CodexBackend implements AgentBackend {
         ]
       : [
           "exec",
+          ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []),
           "--json",
           "--skip-git-repo-check",
           "-C",
@@ -355,6 +410,7 @@ export class CodexBackend implements AgentBackend {
       detached: process.platform !== "win32",
       windowsHide: true,
     });
+    ownedChildren?.add(child);
     trackCodexProcess(child);
     const closed = new Promise<number>((resolve) => {
       child.once("close", (code) => resolve(code ?? 0));

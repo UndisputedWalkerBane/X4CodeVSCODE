@@ -342,7 +342,17 @@ test("different physical folders can run concurrently and failed preparation rel
   assert.equal(starts, 2);
   gate.resolve(); await Promise.all([first, second]);
   p.relocateAttachments = async () => { throw new Error("fixture preparation failed"); };
-  await assert.rejects(p.runTurn("failed", "codex", [], a.id), /preparation failed/);
+  const beforeFailure = p.messages.length;
+  await assert.doesNotReject(p.runTurn("failed", "codex", [], a.id));
+  const errors = p.messages.slice(beforeFailure).filter(message => message.type === "error");
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].path, a.id);
+  assert.match(errors[0].message, /подготовить запуск агента/i);
+  assert.equal(errors[0].message.includes("fixture preparation failed"), false);
+  assert.equal(p.runs.size, 0);
+  p.relocateAttachments = async (_path, files) => files;
+  await p.runTurn("recovered", "codex", [], a.id);
+  assert.equal(starts, 3, "failed preparation releases directory and session ownership for a retry");
   assert.equal(p.runs.size, 0);
 });
 
