@@ -1,8 +1,8 @@
 {
   "name": "agent-hub",
   "displayName": "Agent Hub",
-  "description": "Оболочка над CLI-агентами (Claude Code, Codex) с единым чатом, подтверждениями и общей памятью",
-  "version": "0.0.70",
+  "description": "Claude Code, GPT и сторонние модели через Responses API в чатах VS Code с историей проектов и подтверждениями действий",
+  "version": "0.0.71",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,
@@ -70,6 +70,10 @@
       {
         "command": "agentHub.manageSecretEnv",
         "title": "Agent Hub: Доступы проекта в переменных окружения…"
+      },
+      {
+        "command": "agentHub.manageApiProviders",
+        "title": "Agent Hub: API-провайдеры"
       },
       {
         "command": "agentHub.remoteAccess",

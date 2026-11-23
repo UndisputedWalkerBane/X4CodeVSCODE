@@ -439,3 +439,149 @@ test("Codex cache normalization preserves explicit no-effort capabilities and re
   assert.equal(h.p.buildAgentConfig("codex", "codex-base", "ultra").effort, undefined);
   assert.equal(h.p.codexEffortLevels("other"), null);
 });
+
+test("selecting an API endpoint creates a bound conversation and rejects later endpoint reassignment", async () => {
+  const h = setup(), key = h.projects[0].id, source = h.active();
+  source.chatLog = [{ agent: "codex", role: "user", text: "private old context" }];
+  const profile = { id: "test", name: "Custom", baseUrl: "https://example.test/v1", model: "my-model", apiKey: "test-only-key" };
+  h.p.apiProfileStore = { catalog: async () => [profile], resolve: async () => profile };
+  await h.send({ type: "selectApiProvider", profileId: "test", agent: "codex", recordId: source.id, path: key }, "view");
+  const fresh = h.active();
+  assert.notEqual(fresh.id, source.id);
+  assert.equal(fresh.apiProfile.id, "test");
+  assert.equal(fresh.chatLog?.length ?? 0, 0);
+  assert.equal(fresh.agentIds.codex, null);
+  assert.equal(h.p.getProjectStore(key).sessions.find(r => r.id === source.id).chatLog[0].text, "private old context");
+  const config = await h.p.configForRecord("codex", fresh);
+  assert.equal(config.model, "my-model");
+  assert.equal(config.apiProvider.apiKey, "test-only-key");
+  assert.ok(!JSON.stringify([fresh, h.messages]).includes("test-only-key"));
+  profile.baseUrl = "https://other.test/v1";
+  await assert.rejects(h.p.configForRecord("codex", fresh), /адрес/i);
+  await h.send({ type: "selectApiProvider", profileId: null, agent: "claude", recordId: source.id, path: key }, "view");
+  assert.equal(h.active().id, fresh.id);
+  await h.send({ type: "selectApiProvider", profileId: null, agent: "claude", recordId: fresh.id, path: key }, "view");
+  assert.equal(h.active().preferredAgent, "claude");
+  assert.equal(h.active().apiProfile, undefined);
+});
+
+test("selecting an API profile on a board preserves the single chat and restores the right tile after restart", async () => {
+  const h = setup();
+  const path = h.projects[0].id;
+  for (let i = 0; i < 2; i++) await h.send({ type: "createChat", projectPath: path });
+  const [left, right] = h.p.getChatSlots();
+  const previousActiveId = h.active().id;
+  const profile = { id: "abliteration", name: "Abliteration.ai", baseUrl: "https://api.abliteration.ai/v1", model: "abliterated-model" };
+  h.p.apiProfileStore = { catalog: async () => [profile], resolve: async () => ({ ...profile, apiKey: "fixture-only" }) };
+  await h.send({ type: "selectApiProvider", profileId: profile.id, agent: "codex", path, recordId: right.recordId, chatId: right.chatId });
+  const updated = h.p.findChatSlot(right.chatId), bound = h.slotRecord(updated);
+  assert.notEqual(updated.recordId, right.recordId);
+  assert.equal(h.active().id, previousActiveId);
+  assert.equal(h.p.findChatSlot(left.chatId).recordId, left.recordId);
+  assert.equal(h.slotRecord(left).apiProfile, undefined);
+  assert.equal(bound.apiProfile.id, profile.id);
+  assert.ok(h.messages.some(m => m.type === "agentInfo" && m.chatId === right.chatId && m.requestedApiProfileId === profile.id && m.recordId === updated.recordId));
+  const restored = setup({ global: h.global, workspace: h.workspace });
+  restored.p.apiProfileStore = h.p.apiProfileStore;
+  await restored.send({ type: "multiStateReady" });
+  const state = restored.messages.filter(m => m.type === "multiState").at(-1);
+  assert.equal(state.chats.find(c => c.chatId === right.chatId).apiProfileName, profile.name);
+  assert.equal(state.chats.find(c => c.chatId === left.chatId).apiProfileId, undefined);
+  const catalog = restored.messages.find(m => m.type === "apiProviders");
+  assert.deepEqual(catalog.profiles, [{ id: profile.id, name: profile.name, model: profile.model }]);
+  assert.ok(!JSON.stringify(restored.messages).includes("fixture-only"));
+});
+
+test("new API sessions use current metadata while history retains its original destination", async () => {
+  for (const tiled of [false, true]) {
+    const h = setup(), key = h.projects[0].id, original = h.active(), chatId = tiled ? "chat-new-profile" : undefined;
+    if (tiled) await h.p.saveChatSlots([{ chatId, projectPath: key, recordId: original.id, agent: "claude" }]);
+    const surface = tiled ? "multi-panel" : "view";
+    const active = () => tiled ? h.slotRecord(h.p.findChatSlot(chatId)) : h.active();
+    let profiles = [{ id: "custom", name: "Before", model: "old-model", baseUrl: "https://old.example/v1" }];
+    h.p.apiProfileStore = { catalog: async () => profiles, resolve: async () => profiles[0] };
+    await h.send({ type: "selectApiProvider", profileId: "custom", agent: "codex", path: key, recordId: original.id, chatId }, surface);
+    const saved = active();
+    saved.agentIds.codex = "old-thread";
+    profiles = [{ id: "custom", name: "After", model: "new-model", baseUrl: "https://new.example/v1" }];
+    await h.send({ type: "newSession", chatId, requestId: "new-profile" }, surface);
+    const fresh = active();
+    assert.notEqual(fresh.id, saved.id); assert.deepEqual(fresh.apiProfile, profiles[0]);
+    assert.equal(fresh.agentIds.codex, null); assert.equal(fresh.items.length, 0);
+    assert.equal(saved.apiProfile.baseUrl, "https://old.example/v1");
+    await assert.rejects(h.p.configForRecord("codex", saved), /адрес/i);
+    assert.equal((await h.p.configForRecord("codex", fresh)).model, "new-model");
+    profiles = [];
+    await h.send({ type: "newSession", chatId, requestId: "deleted-profile" }, surface);
+    assert.equal(active().id, fresh.id);
+    assert.match(h.messages.findLast(message => message.contextRequestId === "deleted-profile").error, /выберите/i);
+  }
+});
+
+test("an ordinary history picker opened before a turn cannot rebind the running chat", async () => {
+  const h = setup(), key = h.projects[0].id, original = h.active();
+  const other = { ...structuredClone(original), id: "other-history", items: [{ role: "user", text: "other history" }] };
+  h.p.getProjectStore(key).sessions.push(other);
+  await h.p.showSessions();
+  h.quickPick.selectedItems = [{ sessionId: other.id }];
+  h.p.runs.set(key, new AbortController());
+  await h.acceptProject();
+  assert.equal(h.active().id, original.id);
+  assert.match(h.messages.findLast(message => message.type === "error").message, /занят/i);
+});
+
+test("a rejected API send or steer acknowledges the submitted draft without echoing it", async () => {
+  const h = setup(), key = h.projects[0].id, record = h.active(), chatId = "chat-rejected-draft";
+  await mkdir(h.projects[0].path, { recursive: true });
+  await h.p.saveChatSlots([{ chatId, projectPath: key, recordId: record.id, agent: "codex" }]);
+  record.apiProfile = { id: "custom", name: "API", model: "m", baseUrl: "https://api.example" };
+  h.p.apiProfileStore = { resolve: async () => { throw new Error("Укажите ключ API."); } };
+  h.p.sessionWriters = new Map();
+  for (const type of ["send", "steer"]) {
+    const msg = { type, path: key, chatId, recordId: record.id, apiProfileId: "custom", text: "draft", agent: "codex", requestId: type };
+    await h.send(msg);
+    const result = h.messages.findLast(message => message.type === "sendRejected" && message.requestId === type);
+    assert.equal(result?.recordId, record.id); assert.equal(result.chatId, chatId);
+    assert.equal(result.path, key); assert.match(result.error, /ключ/);
+  }
+  assert.equal(h.messages.some(message => message.type === "userMessage"), false);
+  assert.deepEqual(record.items, []); assert.equal(record.sentMessages, undefined);
+});
+
+test("abandoned API placeholders do not evict meaningful older conversations from the history cap", async () => {
+  const h = setup(), path = h.projects[0].id;
+  const start = h.active();
+  const history = Array.from({ length: 29 }, (_, i) => ({
+    ...start, id: 'saved-' + i, createdAt: i + 1, updatedAt: i + 1,
+    chatLog: [{ role: "user", agent: "codex", text: "saved" }],
+  }));
+  await h.p.mutateProjectStore(path, store => { store.sessions = history; store.activeId = history[0].id; });
+  const profiles = ["a", "b"].map(id => ({ id, name: id, baseUrl: 'https://' + id + '.test/v1', model: id }));
+  h.p.apiProfileStore = { catalog: async () => profiles };
+  for (const profile of profiles) {
+    await h.send({ type: "selectApiProvider", agent: "codex", path, recordId: h.active().id, profileId: profile.id }, "view");
+    assert.equal(h.active().apiProfile.id, profile.id);
+  }
+  await h.send({ type: "newSession" }, "view");
+  assert.equal(h.active().apiProfile.id, "b");
+  const remaining = h.p.getProjectStore(path).sessions;
+  assert.equal(remaining.length, 30);
+  assert.equal(remaining.filter(record => record.chatLog?.length).length, 29);
+});
+
+test("a stale Finish button cannot start a turn or reset the replacement chat", async () => {
+  const h = setup(), path = h.projects[0].id;
+  const profile = { id: "provider", name: "API", baseUrl: "https://example.test/v1", model: "example" };
+  h.p.apiProfileStore = { catalog: async () => [profile] };
+  const originalId = h.active().id;
+  await h.send({ type: "selectApiProvider", agent: "codex", path, recordId: originalId, profileId: profile.id }, "view");
+  const record = h.active();
+  record.agentIds.codex = "external-thread";
+  h.p.runTurn = () => assert.fail("stale click must not call provider");
+  for (const stale of [
+    { recordId: originalId, path, apiProfileId: null },
+    { recordId: record.id, path, apiProfileId: null },
+    { recordId: record.id, path: h.projects[1].id, apiProfileId: profile.id },
+  ]) await h.send({ type: "finishSession", agent: "codex", ...stale }, "view");
+  assert.equal(h.active().agentIds.codex, "external-thread");
+});

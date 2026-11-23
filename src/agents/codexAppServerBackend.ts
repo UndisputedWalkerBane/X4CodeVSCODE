@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
+import { codexLaunch, verifyCodexProvider } from "./apiProviderLaunch";
 import { createLiveAccessBridge } from "../liveAccessEnvironment";
 import {
   CodexBackend,
@@ -144,9 +145,10 @@ export class CodexAppServerBackend implements AgentBackend {
     }
     if (opts.signal.aborted) return;
 
-    const child = spawn("codex", ["app-server", ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []), "--listen", "stdio://"], {
+    const launch = codexLaunch(cfg, opts.extraEnv);
+    const child = spawn("codex", ["app-server", ...launch.args, ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []), "--listen", "stdio://"], {
       cwd: opts.cwd,
-      env: { ...process.env, ...(opts.extraEnv ?? {}) },
+      env: launch.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
@@ -410,7 +412,7 @@ export class CodexAppServerBackend implements AgentBackend {
         }
         case "error": {
           const e = p.error as { message?: string } | undefined;
-          const text = e?.message ?? "Codex: ошибка";
+          const text = launch.redact(e?.message ?? "Codex: ошибка");
           if (p.willRetry) emit({ kind: "notice", text: `Codex: ${text} — повторяет…` });
           else emit({ kind: "error", message: text });
           break;
@@ -433,7 +435,7 @@ export class CodexAppServerBackend implements AgentBackend {
             break;
           }
           if (t.status === "failed") {
-            emit({ kind: "error", message: t.error?.message ?? "Codex: ход завершился с ошибкой" });
+            emit({ kind: "error", message: launch.redact(t.error?.message ?? "Codex: ход завершился с ошибкой") });
           }
           emit({
             kind: "result",
@@ -460,7 +462,7 @@ export class CodexAppServerBackend implements AgentBackend {
         const pr = pending.get(id);
         if (m.error) {
           const error = m.error as Json;
-          pr?.reject(Object.assign(new Error(String(error.message ?? JSON.stringify(error))), { code: error.code }));
+          pr?.reject(Object.assign(new Error(launch.redact(String(error.message ?? JSON.stringify(error)))), { code: error.code }));
         } else {
           pr?.resolve((m.result as Json) ?? {});
         }
@@ -498,7 +500,7 @@ export class CodexAppServerBackend implements AgentBackend {
     child.on("exit", (code) => {
       rejectPending(new Error(`codex app-server завершился (код ${code})`));
       if (!finished && !opts.signal.aborted) {
-        const stderr = stderrChunks.join("").trim();
+        const stderr = launch.redact(stderrChunks.join("").trim());
         emit({
           kind: "error",
           message:
@@ -538,6 +540,7 @@ export class CodexAppServerBackend implements AgentBackend {
           sandbox,
           approvalPolicy: "never",
           ...(cfg.model ? { model: cfg.model } : {}),
+          ...launch.thread,
         };
         let th: Json;
         if (context.kind === "resumeRecovery") {
@@ -577,6 +580,7 @@ export class CodexAppServerBackend implements AgentBackend {
         if (opts.signal.aborted) return;
         threadId = String((th.thread as Json | undefined)?.id ?? threadId ?? "");
         threadReady = true;
+        verifyCodexProvider(launch.thread.modelProvider, th);
         if (threadId) {
           trackCodex(threadId, child);
           yield {

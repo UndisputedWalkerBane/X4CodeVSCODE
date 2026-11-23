@@ -51,7 +51,7 @@ function codexHarness(source, {fork=source.slice(0,1), failList=false, ignore, h
       result={data:req.params.threadId==="source"?source:fork,nextCursor:null};
     }
     if(req.method==="thread/read") result={thread:{id:req.params.threadId,turns:req.params.threadId==="source"?source:fork}};
-    if(req.method==="thread/fork") result={thread:{id:ignore??"fork"}};
+    if(req.method==="thread/fork") result={thread:{id:ignore??"fork"},modelProvider:req.params.modelProvider};
     if(req.method==="turn/start") throw Error("inference forbidden");
     h.child.stdout.write(JSON.stringify({id:req.id,result})+"\n");
   }});
@@ -334,4 +334,23 @@ test("connection-bound recovery tolerates missing status on older fallback respo
   return method === "thread/fork" ? { thread: { id: "fork" } } : { thread: { id: params.threadId, turns: [] } };
  }, { cwd: temp });
  assert.equal(result.resumeSessionId, "fork");
+});
+
+test("API edit and complete-history forks retain the provider and keep its bearer outside RPC and arguments", async () => {
+  const apiProvider = { id: "api-history", name: "Fixture", baseUrl: "https://fixture.test/v1", apiKey: "history-test-secret" };
+  const config = { contextWindow: 0, model: "history-model", apiProvider };
+  const source = [turn("one"), turn("two")];
+  for (const edit of [true, false]) {
+    const h = codexHarness(source, { fork: edit ? source.slice(0, 1) : source });
+    const options = { ...opts(), config };
+    const result = edit ? await new CodexAppServerBackend().prepareEdit(options) : await forkCodexHistoryForResume(options);
+    assert.equal(result.resumeSessionId, "fork");
+    const fork = h.calls.find(r => r.method === "thread/fork").params;
+    assert.match(fork.modelProvider, /^agent_hub_[a-f0-9]+$/);
+    assert.equal(fork.model, "history-model");
+    assert.ok(h.spawnArgs[1].includes(`model_provider="${fork.modelProvider}"`));
+    assert.equal(h.spawnArgs[2].env.AGENT_HUB_RESPONSES_API_KEY, apiProvider.apiKey);
+    assert.ok(!JSON.stringify([h.calls, h.spawnArgs[1]]).includes(apiProvider.apiKey));
+    assert.ok(!h.calls.some(r => r.method === "turn/start"));
+  }
 });

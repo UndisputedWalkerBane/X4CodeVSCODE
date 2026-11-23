@@ -4,6 +4,8 @@
  * CodexBackend  — появится на шаге 4 дорожной карты.
  */
 
+import type { ResolvedApiProviderProfile } from "../apiProviderProfiles";
+
 /** Provider IDs are host-owned metadata, never supplied by the webview. */
 export type NativePromptAnchor =
   | { provider: "codex"; sessionId: string; turnId: string }
@@ -85,6 +87,8 @@ export type AgentEvent =
 
 /** Настройки агента из VS Code settings (модель, effort и т.п.). */
 export interface AgentRunConfig {
+  /** Resolved by the host for this run. Never persist or send to the webview. */
+  apiProvider?: Omit<ResolvedApiProviderProfile, "model">;
   model?: string;
   effort?: string;
   permissionMode?: string;

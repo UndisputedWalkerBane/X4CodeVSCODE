@@ -19,7 +19,10 @@ globalThis[mockKey] = {
     current.spawnArgs = args;
     return current.child;
   },
-  execStart: (prompt, opts) => current.execCalls.push({ prompt, resumeSessionId: opts.resumeSessionId }),
+  execStart: (prompt, opts) => {
+    current.execOptions = opts;
+    current.execCalls.push({ prompt, resumeSessionId: opts.resumeSessionId });
+  },
   hardKill: (child) => {
     const h = child.harness;
     if (child.exitCode !== null || child.signalCode != null) return;
@@ -1047,4 +1050,47 @@ test("closed recovery stdin cannot send a task or fall back to exec", async t =>
  } });
  clock.advance(60_000); await until(() => h.done);
  assert.equal(tasks(h).length, 0); assert.equal(h.execCalls.length, 0); assert.equal(h.children.length, 2); assert.equal(h.events.at(-1).ok, false); assert.equal(clock.pending, 0);
+});
+
+const apiRun = { model: "gateway-model", apiProvider: { id: "fixture-api", name: "Gateway", baseUrl: "https://fixture.test/v1", apiKey: "credential-fixture" } };
+
+test("a native provider on API resume stops before inference and before exec fallback", async t => {
+  const h = await launch(t, { resume: true, config: apiRun, start: false, waitFor: "done",
+    onThread(request, h) { h.reply(request, { thread: { id: h.thread }, model: apiRun.model, modelProvider: "openai" }); },
+  });
+  assert.equal(h.execCalls.length, 0);
+  assert.equal(h.turnRequests().length, 0);
+  assert.equal(h.events.at(-1).ok, false);
+  assert.match(h.events.find(e => e.kind === "error").message, /провайдера/u);
+});
+
+test("startup protocol fallback passes the selected API configuration to exec and masks gateway errors", async t => {
+  const h = await launch(t, { resume: true, config: apiRun, start: false, waitFor: "done",
+    onThread(request, h) { conflictReply(h, request, "unsupported protocol: " + apiRun.apiProvider.apiKey); },
+  });
+  assert.equal(h.execCalls.length, 1);
+  assert.equal(h.execOptions.config.apiProvider, apiRun.apiProvider);
+  assert.equal(h.execOptions.config.model, apiRun.model);
+  assert.ok(!JSON.stringify(h.events).includes(apiRun.apiProvider.apiKey));
+  assert.ok(h.events.some(e => e.kind === "notice" && e.text.includes("[скрыто]")));
+});
+
+test("timeout recovery selects the same API provider for the replacement process and the history fork", async t => {
+  const clock = fakeClock(t);
+  const h = await launchResumeRecovery(t, { config: apiRun, onRequest(role, request, h, child) {
+    if (role !== "recovery" || request.method !== "thread/fork") return;
+    child.forkReady = true;
+    h.reply(child, request, { thread: { id: "verified-fork" }, modelProvider: request.params.modelProvider, model: apiRun.model });
+    return true;
+  } });
+  clock.advance(60_000);
+  await until(() => h.done);
+  const first = h.calls.find(c => c.request.method === "thread/resume").request.params;
+  const fork = h.calls.find(c => c.request.method === "thread/fork").request.params;
+  assert.match(first.modelProvider, /^agent_hub_[a-f0-9]+$/);
+  assert.equal(fork.modelProvider, first.modelProvider);
+  assert.equal(fork.model, first.model);
+  assert.ok(h.children.every(child => child.spawnArgs[2].env.AGENT_HUB_RESPONSES_API_KEY === apiRun.apiProvider.apiKey));
+  assert.ok(!JSON.stringify(h.writes).includes(apiRun.apiProvider.apiKey));
+  assert.equal(h.events.at(-1).ok, true);
 });

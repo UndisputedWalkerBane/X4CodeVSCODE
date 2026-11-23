@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions } from "./types";
+import { codexLaunch } from "./apiProviderLaunch";
 import { createLiveAccessBridge } from "../liveAccessEnvironment";
 
 /**
@@ -349,8 +350,10 @@ export class CodexBackend implements AgentBackend {
   private async *startProcess(prompt: string, opts: StartOptions, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
     const sandbox = cfg.sandbox || "workspace-write";
+    const launch = codexLaunch(cfg, opts.extraEnv);
     const modelFlags = [
-      ...(cfg.model ? ["-m", cfg.model] : []),
+      ...launch.args,
+      ...(cfg.model && !cfg.apiProvider ? ["-m", cfg.model] : []),
       ...(cfg.effort ? ["-c", `model_reasoning_effort="${cfg.effort}"`] : []),
     ];
     // Изображения Codex принимает нативно (vision) через -i.
@@ -404,7 +407,7 @@ export class CodexBackend implements AgentBackend {
 
     const child = spawn("codex", args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...(opts.extraEnv ?? {}) },
+      env: launch.env,
       stdio: ["pipe", "pipe", "pipe"],
       // Своя группа процессов — чтобы убивать вместе с codex-code-mode-host.
       detached: process.platform !== "win32",
@@ -559,7 +562,7 @@ export class CodexBackend implements AgentBackend {
           case "turn.failed": {
             finished = true;
             const err = ev.error as { message?: string } | undefined;
-            yield { kind: "error", message: err?.message ?? "Codex: ход завершился с ошибкой" };
+            yield { kind: "error", message: launch.redact(err?.message ?? "Codex: ход завершился с ошибкой") };
             yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
             break;
           }
@@ -567,7 +570,7 @@ export class CodexBackend implements AgentBackend {
           case "error":
             yield {
               kind: "error",
-              message: typeof ev.message === "string" ? ev.message : "Codex: ошибка",
+              message: launch.redact(typeof ev.message === "string" ? ev.message : "Codex: ошибка"),
             };
             break;
         }
@@ -575,7 +578,7 @@ export class CodexBackend implements AgentBackend {
 
       const exitCode = await closed;
       if (!finished && !opts.signal.aborted) {
-        const stderr = stderrChunks.join("").trim();
+        const stderr = launch.redact(stderrChunks.join("").trim());
         if (opts.resumeSessionId && !executionStarted && WRITER_CONFLICT_RE.test(stderr)) {
           // Только конфликт открытия resume допускает восстановление без
           // риска повторного выполнения уже начавшейся задачи.

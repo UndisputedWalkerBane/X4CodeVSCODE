@@ -11,9 +11,12 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
   AgentId,
+  ApiProviderBinding,
+  ApiProviderOption,
   Attachment,
   AttachmentDraftContext,
   HostToWebview,
+  MultiChatDescriptor,
   ProjectInfo,
   SettingsSnapshot,
   SlashCommandInfo,
@@ -48,7 +51,7 @@ const IN_MULTI_PANEL =
 const CHAT_COMMAND_TYPES = new Set([
   "ready", "send", "steer", "saveTranscript", "permission", "newSession", "finishSession",
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
-  "selectChatProject", "selectChatSession", "selectChatAgent", "pickAttachment", "saveAttachment",
+  "selectChatProject", "selectChatSession", "selectChatAgent", "selectApiProvider", "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
   "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess", "testProjectAccess",
   "prepareMessageEdit", "editMessage",
@@ -60,16 +63,23 @@ const CHAT_EVENT_TYPES = new Set([
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
   "agentInfo", "effortInfo", "taskState",
   "projectAccesses", "projectAccessTestResult",
-  "messageEditPrepared", "editMessageResult",
+  "messageEditPrepared", "editMessageResult", "sendRejected",
 ]);
 
-interface MultiChatSlotView {
-  chatId: string;
-  projectPath: string;
-  recordId: string;
+interface ProviderSelection {
   agent: AgentId;
-  title: string;
+  /** Absent for native-to-native switches, null when leaving an API provider. */
+  profileId?: string | null;
 }
+
+interface SubmittedApiDraft {
+  requestId: string;
+  path: string;
+  recordId: string;
+  text: string;
+  attachments: Attachment[];
+}
+type QueuedSend = Extract<WebviewToHost, { type: "send" }> & { sourceDraft?: SubmittedApiDraft };
 
 function ServerAddress({ host }: { host?: string }) {
   const address = host?.trim();
@@ -279,11 +289,17 @@ function ChatTile({
   initialProjectPath,
   initialRecordId,
   initialAgent,
+  initialApiProfileId,
+  initialApiProfileName,
+  initialApiProfileModel,
 }: {
   chatId?: string;
   initialProjectPath?: string;
   initialRecordId?: string;
   initialAgent?: AgentId;
+  initialApiProfileId?: string;
+  initialApiProfileName?: string;
+  initialApiProfileModel?: string;
 } = {}) {
   const post = useCallback((msg: WebviewToHost) => {
     const scoped = chatId && CHAT_COMMAND_TYPES.has(msg.type)
@@ -305,9 +321,7 @@ function ChatTile({
   const [busyBy, setBusyBy] = useState<Record<string, boolean>>({});
   const [activityBy, setActivityBy] = useState<Record<string, string | null>>({});
   const [busyStartBy, setBusyStartBy] = useState<Record<string, number>>({});
-  const [queueBy, setQueueBy] = useState<
-    Record<string, { text: string; attachments: Attachment[]; agent: AgentId }[]>
-  >({});
+  const [queueBy, setQueueBy] = useState<Record<string, QueuedSend[]>>({});
   const [sessionsBy, setSessionsBy] = useState<
     Record<string, Record<AgentId, string | null>>
   >({});
@@ -330,8 +344,22 @@ function ChatTile({
   const [slashIdx, setSlashIdx] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [agent, setAgent] = useState<AgentId>(initialAgent ?? "claude");
+  const [apiProviders, setApiProviders] = useState<ApiProviderOption[]>([]);
+  const [apiBinding, setApiBinding] = useState<ApiProviderBinding>({
+    apiProfileId: initialApiProfileId, apiProfileName: initialApiProfileName, apiProfileModel: initialApiProfileModel,
+  });
   const [agentReady, setAgentReady] = useState(initialAgent !== undefined);
   const [draft, setDraft] = useState("");
+  // API credentials can fail before the host echoes a prompt. Keep the local
+  // draft until that request is accepted or can be returned to its composer.
+  const submittedDrafts = useRef(new Map<string, SubmittedApiDraft>());
+  const restoreIntoEmptyComposer = useRef<string | undefined>(undefined);
+  const [rejectedDrafts, setRejectedDrafts] = useState<(SubmittedApiDraft & { error: string })[]>([]);
+  const [sendError, setSendError] = useState("");
+  const postPrompt = useCallback(({ sourceDraft, ...message }: Extract<WebviewToHost, { type: "send" | "steer" }> & { sourceDraft?: SubmittedApiDraft }) => {
+    if (sourceDraft) submittedDrafts.current.set(sourceDraft.requestId, sourceDraft);
+    post(message);
+  }, [post]);
   // The ordinary composer stays intact while a sent message has its own draft.
   const [messageEdit, setMessageEdit] = useState<MessageEditDraft | null>(null);
   const messageEditRef = useRef<MessageEditDraft | null>(null);
@@ -425,7 +453,10 @@ function ChatTile({
     const edit = messageEditRef.current;
     if (edit) {
       if (edit.phase === "ready") updateMessageEdit({ ...edit, text });
-    } else setDraft(text);
+    } else {
+      restoreIntoEmptyComposer.current = undefined;
+      setDraft(text);
+    }
   };
   const setPending = (fn: (prev: Attachment[]) => Attachment[]) => {
     const edit = messageEditRef.current;
@@ -504,12 +535,15 @@ function ChatTile({
   /** A tile owns one exact record; project paths alone cannot identify a session. */
   const bindingRef = useRef({ projectPath: initialProjectPath ?? "", recordId: initialRecordId });
   const pendingProjectRef = useRef<string | null>(null);
-  const pendingAgentRef = useRef<AgentId | null>(null);
+  const pendingAgentRef = useRef<ProviderSelection | null>(null);
   const pendingSessionRef = useRef<string | null>(null);
   const itemRecordsRef = useRef(new WeakMap<ChatItem[], string>());
   const replaceBinding = useCallback((projectPath: string, recordId: string | undefined) => {
     const previous = bindingRef.current;
     if (previous.projectPath !== projectPath || previous.recordId !== recordId) {
+      restoreIntoEmptyComposer.current = undefined;
+      setSendError("");
+      setApiBinding({});
       normalAttachmentDraftRef.current = draftId();
       filePickerTargetRef.current = null;
       imageReplacementRef.current = null;
@@ -555,6 +589,9 @@ function ChatTile({
   const sessions = sessionsBy[activePath] ?? NO_SESSIONS;
   const contextUsage = ctxBy[activePath] ?? NO_CTX;
   const models = modelsBy[activePath] ?? NO_MODELS;
+  const apiProvider = apiProviders.find(profile => profile.id === apiBinding.apiProfileId);
+  const selectedProfileId = pendingAgentRef.current ? pendingAgentRef.current.profileId : apiBinding.apiProfileId;
+  const selectedProvider = selectedProfileId ? `api:${selectedProfileId}` : pendingAgentRef.current?.agent ?? agent;
   const efforts = effortsBy[activePath] ?? {};
   const queue = queueBy[activePath] ?? [];
   const editBlocked = busy || agentSwitching || projectSwitching || !agentReady;
@@ -702,18 +739,6 @@ function ChatTile({
     [mutateItems],
   );
 
-  /**
-   * Отправка хосту. Пузырь пользователя НЕ добавляем локально — его эхом
-   * рассылает хост (userMessage) обеим поверхностям, иначе ленты сайдбара и
-   * вкладки расходятся и автосохранение теряет промпты.
-   */
-  const dispatchSend = useCallback(
-    (path: string, text: string, attachments: Attachment[], agentId: AgentId) => {
-      post({ type: "send", text, agent: agentId, attachments, path });
-    },
-    [post],
-  );
-
   useEffect(() => {
     const onMessage = (e: MessageEvent<HostToWebview>) => {
       const msg = e.data;
@@ -723,6 +748,9 @@ function ChatTile({
       // Адресат события: свой проект или активный, если метки нет.
       const p = ("path" in msg && msg.path) || activeRef.current;
       switch (msg.type) {
+        case "apiProviders":
+          setApiProviders(msg.profiles);
+          break;
         case "chatProjectRejected": {
           if (!chatId || (pendingProjectRef.current && pendingProjectRef.current !== msg.requestedProjectPath)) break;
           if (!pendingProjectRef.current && bindingRef.current.projectPath !== msg.projectPath) break;
@@ -746,7 +774,9 @@ function ChatTile({
           setProjectSwitching(false);
           activeRef.current = slot.projectPath;
           setActivePath(slot.projectPath);
-          if (!pendingAgentRef.current || pendingAgentRef.current === slot.agent) {
+          setApiBinding({ apiProfileId: slot.apiProfileId, apiProfileName: slot.apiProfileName, apiProfileModel: slot.apiProfileModel });
+          const pending = pendingAgentRef.current;
+          if (!pending || (pending.profileId === undefined && pending.agent === slot.agent && !slot.apiProfileId)) {
             pendingAgentRef.current = null;
             setAgentSwitching(false);
             setAgent(slot.agent);
@@ -766,7 +796,7 @@ function ChatTile({
             if (q.length > 0) {
               const [next, ...rest] = q;
               setQueueBy((prev) => ({ ...prev, [p]: rest }));
-              setTimeout(() => dispatchSend(p, next.text, next.attachments, next.agent), 60);
+              setTimeout(() => postPrompt(next), 60);
             }
           }
           break;
@@ -885,13 +915,21 @@ function ChatTile({
         case "agentInfo": {
           if (p !== activeRef.current) break;
           if (msg.contextRequestId ? pendingSessionRef.current !== msg.contextRequestId : pendingSessionRef.current) break;
-          if (chatId && msg.recordId && msg.recordId !== bindingRef.current.recordId) break;
           const pending = pendingAgentRef.current;
-          if (pending && (msg.requestedAgent ? msg.requestedAgent !== pending : msg.agent !== pending)) break;
-          const recordChanged = !chatId && !!msg.recordId && bindingRef.current.recordId !== msg.recordId;
-          if (!chatId && msg.recordId) {
+          if (pending && (msg.requestedApiProfileId !== pending.profileId ||
+              (msg.requestedAgent ?? msg.agent) !== pending.agent)) break;
+          const recordChanged = !!msg.recordId && bindingRef.current.recordId !== msg.recordId;
+          // Board snapshots own tile navigation. A requested API switch can bind a
+          // fresh record before its board snapshot and transcript arrive.
+          if (chatId && recordChanged && !(pending && msg.requestedApiProfileId !== undefined)) break;
+          if (msg.recordId) {
             if (recordChanged) updateTaskSnapshot(null);
             replaceBinding(p, msg.recordId);
+          }
+          if (msg.apiProfileId) {
+            setApiBinding({ apiProfileId: msg.apiProfileId, apiProfileName: msg.apiProfileName, apiProfileModel: msg.apiProfileModel });
+          } else if (msg.requestedApiProfileId !== undefined || msg.agent !== "codex") {
+            setApiBinding({});
           }
           pendingAgentRef.current = null;
           pendingSessionRef.current = null;
@@ -899,7 +937,7 @@ function ChatTile({
           setAgentReady(true);
           setAgent(msg.agent);
           // Earlier hydration was rejected while this session request was pending.
-          if (recordChanged && msg.contextRequestId) post({ type: "ready" });
+          if (recordChanged && (msg.contextRequestId || msg.requestedApiProfileId !== undefined)) post({ type: "ready" });
           if (msg.error) mutateItems(p, (items) => [...items, { id: nextId++, role: "error", text: msg.error! }]);
           break;
         }
@@ -1013,6 +1051,7 @@ function ChatTile({
             finishAttachmentUpload(upload.id, "Для замены выберите изображение PNG, JPEG, GIF, WebP или BMP.");
             break;
           }
+          restoreIntoEmptyComposer.current = undefined;
           setPendingBy((prev) => {
             const cur = prev[target] ?? [];
             return {
@@ -1023,7 +1062,27 @@ function ChatTile({
           if (upload) finishAttachmentUpload(upload.id);
           break;
         }
-        case "userMessage":
+        case "sendRejected": {
+          const original = submittedDrafts.current.get(msg.requestId);
+          if (!original || original.path !== msg.path || original.recordId !== msg.recordId) break;
+          submittedDrafts.current.delete(msg.requestId);
+          if (restoreIntoEmptyComposer.current === msg.requestId && !messageEditRef.current &&
+              bindingRef.current.projectPath === msg.path && bindingRef.current.recordId === msg.recordId &&
+              activeRef.current === msg.path && !pendingProjectRef.current && !pendingAgentRef.current && !pendingSessionRef.current) {
+            restoreIntoEmptyComposer.current = undefined;
+            setDraft(original.text);
+            setPendingBy(prev => ({ ...prev, [msg.path]: original.attachments }));
+            setSendError(msg.error);
+          } else {
+            setRejectedDrafts(prev => [...prev, { ...original, error: msg.error }]);
+          }
+          break;
+        }
+        case "userMessage": {
+          const original = msg.requestId && submittedDrafts.current.get(msg.requestId);
+          if (original && original.path === p && original.recordId === msg.recordId) {
+            submittedDrafts.current.delete(original.requestId);
+          }
           if (msg.recordId && p === bindingRef.current.projectPath &&
               msg.recordId !== bindingRef.current.recordId) break;
           finalizeStreaming(p);
@@ -1039,6 +1098,7 @@ function ChatTile({
             },
           ]);
           break;
+        }
         case "textDelta":
           appendDelta(p, msg.text);
           break;
@@ -1134,7 +1194,7 @@ function ChatTile({
     window.addEventListener("message", onMessage);
     post({ type: "ready" });
     return () => window.removeEventListener("message", onMessage);
-  }, [appendDelta, finalizeStreaming, mutateItems, dispatchSend, clearServerTest, updateServerTest,
+  }, [appendDelta, finalizeStreaming, mutateItems, clearServerTest, updateServerTest, postPrompt,
     updateTaskSnapshot, post, chatId, replaceBinding, updateMessageEdit, editMatchesSource, finishAttachmentUpload]);
 
   // Ленты сохраняются на хосте; шлём ТОЛЬКО изменившиеся (по ссылке) —
@@ -1361,23 +1421,32 @@ function ChatTile({
     const finalText = text || "Посмотри приложенные файлы.";
     const attachments = pending;
     const path = activePath;
+    const recordId = bindingRef.current.recordId;
+    const sourceDraft = apiBinding.apiProfileId && recordId
+      ? { requestId: Array.from(crypto.getRandomValues(new Uint32Array(4))).join("-"), path, recordId, text: draft, attachments }
+      : undefined;
+    const prompt = { text: finalText, attachments, path, agent,
+      recordId, apiProfileId: apiBinding.apiProfileId ?? null,
+      ...(sourceDraft && { requestId: sourceDraft.requestId, sourceDraft }) };
+    restoreIntoEmptyComposer.current = sourceDraft?.requestId;
+    setSendError("");
     setDraft("");
     normalAttachmentDraftRef.current = draftId();
     setPendingBy((prev) => ({ ...prev, [path]: [] }));
     if (busyBy[path] && sendMode !== "later") {
       // Корректировка на лету: сообщение уходит в идущий ход.
-      post({ type: "steer", text: finalText, mode: sendMode, agent, attachments, path });
+      postPrompt({ type: "steer", mode: sendMode, ...prompt });
       return;
     }
     if (busyBy[path]) {
       // Режим «после хода»: в очередь проекта; уйдёт сам после ответа.
       setQueueBy((prev) => ({
         ...prev,
-        [path]: [...(prev[path] ?? []), { text: finalText, attachments, agent }],
+        [path]: [...(prev[path] ?? []), { type: "send", ...prompt }],
       }));
       return;
     }
-    dispatchSend(path, finalText, attachments, agent);
+    postPrompt({ type: "send", ...prompt });
   };
 
   /** Вставка/перетаскивание файлов: байты уходят хосту, он сохраняет в проект. */
@@ -1390,6 +1459,7 @@ function ChatTile({
     }
     const binding = bindingRef.current;
     if (!binding.recordId) return null;
+    restoreIntoEmptyComposer.current = undefined;
     return { path: binding.projectPath,
       context: { draftId: normalAttachmentDraftRef.current, recordId: binding.recordId }, editing: false };
   };
@@ -1518,6 +1588,28 @@ function ChatTile({
     post(chatId
       ? { type: "selectChatProject", chatId, projectPath: value }
       : { type: "selectProject", path: value });
+  };
+
+  const onProviderChange = (value: string) => {
+    if (busy || !agentReady || pendingAgentRef.current || pendingProjectRef.current || pendingSessionRef.current) return;
+    const profile = apiProviders.find(entry => `api:${entry.id}` === value);
+    if (!profile && value !== "claude" && value !== "codex") return;
+    const nextAgent = value === "claude" ? "claude" : "codex";
+    const recordId = bindingRef.current.recordId;
+    const switchingApi = !!(profile || apiBinding.apiProfileId);
+    if (switchingApi && !recordId) return;
+    cancelMessageEdit(false);
+    setChoice(null);
+    setAgentSwitching(true);
+    if (switchingApi && recordId) {
+      const profileId = profile?.id ?? null;
+      pendingAgentRef.current = { agent: nextAgent, profileId };
+      post({ type: "selectApiProvider", profileId, agent: nextAgent, path: activePath, recordId });
+    } else {
+      pendingAgentRef.current = { agent: nextAgent };
+      post(chatId ? { type: "selectChatAgent", chatId, agent: nextAgent }
+        : { type: "selectAgent", agent: nextAgent, path: activePath });
+    }
   };
 
   const formatElapsed = (s: number) =>
@@ -1899,6 +1991,13 @@ function ChatTile({
                 })}
               />
 
+              {!REMOTE && <section>
+                <h3>API-провайдеры</h3>
+                <button className="finish-btn" type="button" onClick={() => post({ type: "manageApiProviders" })}>
+                  Настроить API-провайдеры…
+                </button>
+              </section>}
+
               <section>
                 <h3>Claude</h3>
                 <label className="set-row">
@@ -2191,7 +2290,7 @@ function ChatTile({
             className="project-select"
             aria-label="Проект"
             value={activePath}
-            disabled={busy || projectSwitching}
+            disabled={busy || projectSwitching || agentSwitching}
             onChange={(e) => onProjectChange(e.target.value)}
             title={
               activeProject
@@ -2222,21 +2321,20 @@ function ChatTile({
         <select
           className="agent-select"
           aria-label="Провайдер чата"
-          value={agentReady ? agent : ""}
-          onChange={(e) => {
-            const nextAgent = e.target.value as AgentId;
-            cancelMessageEdit(false);
-            pendingAgentRef.current = nextAgent;
-            setAgentSwitching(true);
-            setAgent(nextAgent);
-            if (chatId) post({ type: "selectChatAgent", chatId, agent: nextAgent });
-            else post({ type: "selectAgent", agent: nextAgent, path: activePath });
-          }}
-          disabled={busy || agentSwitching || !agentReady}
+          value={agentReady ? selectedProvider : ""}
+          onChange={(e) => onProviderChange(e.target.value)}
+          disabled={busy || agentSwitching || projectSwitching || !agentReady}
         >
           {!agentReady && <option value="" disabled>Загрузка провайдера…</option>}
           <option value="claude">Claude</option>
           <option value="codex">GPT (Codex)</option>
+          {apiBinding.apiProfileId && !apiProvider &&
+            <option value={`api:${apiBinding.apiProfileId}`} disabled>{apiBinding.apiProfileName ?? "API-провайдер"}</option>}
+          {apiProviders.map(profile => (
+            <option key={profile.id} value={`api:${profile.id}`} disabled={!bindingRef.current.recordId}>
+              {profile.id === apiBinding.apiProfileId ? apiBinding.apiProfileName ?? profile.name : profile.name}
+            </option>
+          ))}
         </select>
         <button
           className="finish-btn"
@@ -2285,8 +2383,11 @@ function ChatTile({
         <button
           className="finish-btn"
           title="Записать итоги сессии в журнал (docs/journal) и начать новую"
-          disabled={busy || !sessionId || !agentReady || agentSwitching}
-          onClick={() => post({ type: "finishSession", agent })}
+          disabled={busy || !sessionId || !agentReady || agentSwitching || !bindingRef.current.recordId}
+          onClick={() => {
+            const { projectPath, recordId } = bindingRef.current;
+            if (recordId) post({ type: "finishSession", agent, path: projectPath, recordId, apiProfileId: apiBinding.apiProfileId ?? null });
+          }}
         >
           ✍ Итоги
         </button>
@@ -2318,29 +2419,30 @@ function ChatTile({
       </header>
       <div className="statusbar">
         <button
-          className={`model-badge ${models[agent].fallbackFrom ? "model-fallback" : ""}`}
+          className={`model-badge ${!apiBinding.apiProfileId && models[agent].fallbackFrom ? "model-fallback" : ""}`}
           title={
-            (models[agent].fallbackFrom
+            apiBinding.apiProfileId ? "Модель профиля API для этой сессии" : (models[agent].fallbackFrom
               ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
               : "") +
             (chatId
               ? "Клик — выбрать модель этой плитки или общую модель. Новая сессия использует правила по умолчанию"
               : "Клик — выбрать модель этой сессии или общую модель провайдера (применится со следующего хода)")
           }
-          disabled={!agentReady || agentSwitching}
+          disabled={!agentReady || agentSwitching || !!apiBinding.apiProfileId}
           onClick={() => post({ type: "pickModel", agent })}
         >
-          {models[agent].fallbackFrom
+          {apiBinding.apiProfileId ? apiBinding.apiProfileModel ?? apiProvider?.model ?? "Модель профиля API" : models[agent].fallbackFrom
             ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
             : models[agent].model || "модель: по умолчанию CLI"}
         </button>
         <button
           className="safety-btn"
-          title="Effort этой сессии — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"
-          disabled={!agentReady || agentSwitching}
+          title={apiBinding.apiProfileId ? "Для профиля API выбор effort недоступен" :
+            "Effort этой сессии — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"}
+          disabled={!agentReady || agentSwitching || !!apiBinding.apiProfileId}
           onClick={() => post({ type: "pickEffort", agent })}
         >
-          ⚡ {efforts[agent] || "effort: авто"}
+          ⚡ {apiBinding.apiProfileId ? "effort: —" : efforts[agent] || "effort: авто"}
         </button>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
@@ -2663,6 +2765,26 @@ function ChatTile({
             <span className="message-edit-missing-hint">Прикрепите эти файлы заново или уберите их перед сохранением.</span>
           </div>
         ) : null}
+        {sendError && <div className="message-edit-error" role="alert">{sendError}</div>}
+        {!messageEdit && rejectedDrafts.filter(entry => entry.path === activePath && entry.recordId === bindingRef.current.recordId)
+          .map(entry => (
+            <div key={entry.requestId} className="message-edit-banner">
+              <span role="alert">{entry.error}</span>
+              <span>{entry.text.slice(0, 100) || entry.attachments.map(file => file.name).join(", ")}</span>
+              <button type="button" className="finish-btn" disabled={!agentReady || agentSwitching || projectSwitching ||
+                !!draft || !!pending.length || !!currentAttachmentUploads.length || !!textAttachment}
+                title="Восстановить текст и вложения в пустое поле сообщения"
+                onClick={() => {
+                  if (bindingRef.current.recordId !== entry.recordId || bindingRef.current.projectPath !== entry.path ||
+                      pendingAgentRef.current || pendingProjectRef.current || pendingSessionRef.current) return;
+                  restoreIntoEmptyComposer.current = undefined;
+                  normalAttachmentDraftRef.current = draftId();
+                  setDraft(entry.text);
+                  setPendingBy(prev => ({ ...prev, [entry.path]: entry.attachments }));
+                  setRejectedDrafts(prev => prev.filter(item => item.requestId !== entry.requestId));
+                }}>Восстановить черновик</button>
+            </div>
+          ))}
         {attachmentError && <div className="message-edit-error" role="alert">{attachmentError}</div>}
         {!!currentAttachmentUploads.length && <div role="status">Добавляю вложения…</div>}
         {queue.length > 0 && !messageEdit && (
@@ -2674,19 +2796,14 @@ function ChatTile({
                 <button
                   className="attach-remove"
                   title="Скорректировать: докинуть это сообщение в идущий ход сейчас"
+                  disabled={!agentReady || agentSwitching || projectSwitching}
                   onClick={() => {
+                    if (pendingAgentRef.current || pendingProjectRef.current || pendingSessionRef.current) return;
                     setQueueBy((prev) => ({
                       ...prev,
                       [activePath]: (prev[activePath] ?? []).filter((_, j) => j !== i),
                     }));
-                    post({
-                      type: "steer",
-                      text: q.text,
-                      mode: "next",
-                      agent: q.agent,
-                      attachments: q.attachments,
-                      path: activePath,
-                    });
+                    postPrompt({ ...q, type: "steer", mode: "next" });
                   }}
                 >
                   ↪
@@ -3029,7 +3146,7 @@ function MultiChatBoard() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [archivedProjects, setArchivedProjects] = useState<ProjectInfo[]>([]);
   const [archiveOpen, setArchiveOpen] = useState(false);
-  const [chats, setChats] = useState<MultiChatSlotView[]>([]);
+  const [chats, setChats] = useState<MultiChatDescriptor[]>([]);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [compactMode, setCompactMode] = useState(false);
   const [compactPending, setCompactPending] = useState(false);
@@ -3108,7 +3225,7 @@ function MultiChatBoard() {
                 <header className="multi-chat-tile-header">
                   <div className="multi-chat-tile-heading">
                     <span className="multi-chat-tile-title" title={`${project?.name ?? "Проект"} · ${slot.title}`}>
-                      {project?.name ?? "Проект"} · {slot.agent === "claude" ? "Claude" : "GPT (Codex)"}
+                      {project?.name ?? "Проект"} · {slot.apiProfileName ?? (slot.agent === "claude" ? "Claude" : "GPT (Codex)")}
                     </span>
                     <ServerAddress host={project?.serverHost} />
                   </div>
@@ -3136,6 +3253,9 @@ function MultiChatBoard() {
                     initialProjectPath={slot.projectPath}
                     initialRecordId={slot.recordId}
                     initialAgent={slot.agent}
+                    initialApiProfileId={slot.apiProfileId}
+                    initialApiProfileName={slot.apiProfileName}
+                    initialApiProfileModel={slot.apiProfileModel}
                   />}
                 </div>
               </section>

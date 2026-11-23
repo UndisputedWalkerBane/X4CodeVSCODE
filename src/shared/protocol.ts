@@ -10,6 +10,27 @@ import type { ProjectAccessConnectionInput, ProjectAccessInput, ProjectAccessPro
 /** Какие агенты доступны в переключателе. */
 export type AgentId = "claude" | "codex";
 
+/** Only these display fields from an API profile are sent to a webview. */
+export interface ApiProviderOption {
+  id: string;
+  name: string;
+  model: string;
+}
+
+export interface ApiProviderBinding {
+  apiProfileId?: string;
+  apiProfileName?: string;
+  apiProfileModel?: string;
+}
+
+export interface MultiChatDescriptor extends ApiProviderBinding {
+  chatId: string;
+  projectPath: string;
+  recordId: string;
+  agent: AgentId;
+  title: string;
+}
+
 export interface AgentModelOption {
   value: string;
   label?: string;
@@ -85,6 +106,8 @@ export type WebviewToHost =
   | { type: "selectChatSession"; chatId: string; recordId: string }
   | { type: "selectChatAgent"; chatId: string; agent: AgentId }
   | { type: "selectAgent"; agent: AgentId; path?: string }
+  | { type: "selectApiProvider"; profileId: string | null; agent: AgentId; path: string; recordId: string; chatId?: string }
+  | { type: "manageApiProviders" }
   | { type: "duplicateProject"; path: string; copyFolder: boolean }
   | { type: "archiveProject"; path: string }
   | { type: "restoreProject"; path: string }
@@ -93,9 +116,12 @@ export type WebviewToHost =
   | { type: "reorderProjects"; paths: string[] }
   | {
       type: "send";
+      requestId?: string;
       text: string;
       agent: AgentId;
       attachments?: Attachment[];
+      recordId?: string;
+      apiProfileId?: string | null;
       /** Логический ключ проекта (id либо путь старой записи; пусто — активный).
        * Нужен очереди
        *  фонового проекта, чтобы не стрелять в активный. */
@@ -105,11 +131,14 @@ export type WebviewToHost =
   | {
       /** Докинуть сообщение в идущий ход (корректировка на лету). */
       type: "steer";
+      requestId?: string;
       text: string;
       /** now — немедленно, прервав шаг; next — на ближайшей границе шага. */
       mode: "now" | "next";
       agent: AgentId;
       attachments?: Attachment[];
+      recordId?: string;
+      apiProfileId?: string | null;
       path?: string;
       chatId?: string;
     }
@@ -127,7 +156,7 @@ export type WebviewToHost =
     }
   | { type: "stop"; path?: string; chatId?: string }
   | { type: "newSession"; chatId?: string; requestId?: string }
-  | { type: "finishSession"; agent: AgentId; chatId?: string }
+  | { type: "finishSession"; agent: AgentId; path: string; recordId: string; apiProfileId: string | null; chatId?: string }
   | { type: "permission"; requestId: string; allow: boolean; answer?: string; chatId?: string }
   | { type: "selectProject"; path: string }
   | { type: "addProject" }
@@ -203,6 +232,7 @@ export type HostToWebview =
       /** Эхо сообщения пользователя: пузырь создаёт хост, чтобы обе
        *  поверхности (сайдбар и вкладка) имели одинаковую ленту. */
       type: "userMessage";
+      requestId?: string;
       text: string;
       attachments?: string[];
       sentMessage?: SentUserMessage;
@@ -210,6 +240,7 @@ export type HostToWebview =
       path?: string;
       chatId?: string;
     }
+  | { type: "sendRejected"; requestId: string; recordId: string; path: string; chatId?: string; error: string }
   | { type: "textDelta"; text: string; path?: string; chatId?: string }
   | { type: "assistantText"; text: string; path?: string; chatId?: string }
   | { type: "toolUse"; toolName: string; summary: string; path?: string; chatId?: string }
@@ -240,9 +271,10 @@ export type HostToWebview =
   | { type: "permissionResolved"; requestId: string; allow: boolean; path?: string; chatId?: string }
   | { type: "projects"; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; activePath: string; chatId?: string }
   | { type: "transcript"; path: string; items: unknown[]; chatId?: string; recordId?: string }
-  | { type: "multiState"; boardId?: string; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; chats: { chatId: string; projectPath: string; recordId: string; agent: AgentId; title: string }[] }
+  | { type: "multiState"; boardId?: string; projects: ProjectInfo[]; archivedProjects?: ProjectInfo[]; chats: MultiChatDescriptor[] }
   | { type: "compactMode"; enabled: boolean; pending?: boolean; error?: string }
-  | { type: "agentInfo"; agent: AgentId; path?: string; chatId?: string; recordId?: string; requestedAgent?: AgentId; contextRequestId?: string; error?: string }
+  | ({ type: "agentInfo"; agent: AgentId; path?: string; chatId?: string; recordId?: string; requestedAgent?: AgentId; requestedApiProfileId?: string | null; contextRequestId?: string; error?: string } & ApiProviderBinding)
+  | { type: "apiProviders"; profiles: ApiProviderOption[] }
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
   | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }

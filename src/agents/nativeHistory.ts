@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { isDeepStrictEqual } from "node:util";
 import { stopCodex, trackCodexProcess } from "./codexBackend";
+import { codexLaunch, verifyCodexProvider } from "./apiProviderLaunch";
 import type { PrepareEditOptions, PreparedEdit } from "./types";
 
 type Json = Record<string, unknown>;
@@ -52,6 +53,7 @@ export function uniqueLegacyIndex(texts: (string | undefined)[], prompt: string 
 type CodexHistoryOptions = Pick<PrepareEditOptions, "cwd" | "sessionId" | "config" | "extraEnv" | "signal">;
 type HistoryClient = {
   request: (method: string, params: Json) => Promise<Json>;
+  providerThread: ReturnType<typeof codexLaunch>["thread"];
   readTurns: (threadId: string, full: boolean) => Promise<Json[]>;
 };
 
@@ -93,8 +95,9 @@ async function readCodexHistoryTurns(
 /** A separate owned connection for persisted history; never resumes or starts inference. */
 async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: HistoryClient) => Promise<T>): Promise<T> {
   opts.signal.throwIfAborted();
-  const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
-    cwd: opts.cwd, env: { ...process.env, ...(opts.extraEnv ?? {}) },
+  const launch = codexLaunch(opts.config, opts.extraEnv);
+  const child = spawn("codex", ["app-server", ...launch.args, "--listen", "stdio://"], {
+    cwd: opts.cwd, env: launch.env,
     stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", windowsHide: true,
   });
   trackCodexProcess(child);
@@ -117,7 +120,7 @@ async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: Hist
     if (!entry) return;
     if (message.error) {
       const error = message.error as Json;
-      entry.reject(Object.assign(new Error(String(error.message ?? "Codex RPC failed")), { code: error.code }));
+      entry.reject(Object.assign(new Error(launch.redact(String(error.message ?? "Codex RPC failed"))), { code: error.code }));
     } else entry.resolve((message.result ?? {}) as Json);
   });
   opts.signal.addEventListener("abort", onAbort, { once: true });
@@ -141,7 +144,7 @@ async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: Hist
     opts.signal.throwIfAborted();
     if (!child.stdin.writable || child.stdin.destroyed || child.stdin.writableEnded) throw new Error("Codex: соединение закрыто");
     child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
-    result = await use({ request, readTurns });
+    result = await use({ request, readTurns, providerThread: launch.thread });
   } finally {
     opts.signal.removeEventListener("abort", onAbort);
     rejectAll(new Error("Codex: соединение закрыто"));
@@ -161,7 +164,7 @@ async function withCodexHistory<T>(opts: CodexHistoryOptions, use: (client: Hist
 export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<PreparedEdit> {
   opts.signal.throwIfAborted();
   if (!opts.sessionId || (opts.anchor && (opts.anchor.provider !== "codex" || opts.anchor.sessionId !== opts.sessionId))) throw unavailable();
-  return withCodexHistory(opts, async ({ request, readTurns }) => {
+  return withCodexHistory(opts, async ({ request, readTurns, providerThread }) => {
     const source = await readTurns(opts.sessionId, !opts.anchor);
     const matches = opts.anchor ? [] : legacyMatches(source.map(firstUserText), opts.legacyPrompt);
     if (!opts.anchor && matches.length !== 1) {
@@ -178,7 +181,8 @@ export async function prepareCodexEdit(opts: PrepareEditOptions): Promise<Prepar
     if (index === 0) return {};
     const prefix = source.slice(0, index);
     if (prefix.some((turn) => !["completed", "interrupted", "failed"].includes(String(turn.status)))) throw new Error("Дождитесь завершения предыдущих ходов Codex перед редактированием.");
-    const fork = await request("thread/fork", { threadId: opts.sessionId, lastTurnId: prefix.at(-1)?.id, cwd: opts.cwd, excludeTurns: true });
+    const fork = await request("thread/fork", { threadId: opts.sessionId, lastTurnId: prefix.at(-1)?.id, cwd: opts.cwd, ...providerThread, excludeTurns: true });
+    verifyCodexProvider(providerThread.modelProvider, fork);
     const id = (fork.thread as Json | undefined)?.id;
     if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред для редактирования. Обновите CLI.");
     const actual = await readTurns(id, !opts.anchor);
@@ -213,6 +217,7 @@ export async function forkCodexHistoryOnConnection(
     ...common, threadId: opts.sessionId, ...(source.length ? { lastTurnId: source.at(-1)?.id } : {}), excludeTurns: true,
   });
   opts.signal.throwIfAborted();
+  verifyCodexProvider(common.modelProvider, response);
   const thread = response.thread as Json | undefined;
   const id = thread?.id;
   if (typeof id !== "string" || !id.trim() || id === opts.sessionId) throw new Error("Codex не создал отдельный тред с копией истории.");
@@ -230,8 +235,8 @@ export async function forkCodexHistoryOnConnection(
 export async function forkCodexHistoryForResume(opts: CodexHistoryOptions): Promise<{ resumeSessionId: string }> {
   opts.signal.throwIfAborted();
   if (typeof opts.sessionId !== "string" || !opts.sessionId.trim()) throw new Error("Codex: отсутствует исходный тред истории.");
-  return withCodexHistory(opts, async ({ request }) => {
-    const fork = await forkCodexHistoryOnConnection(opts, request, { cwd: opts.cwd });
+  return withCodexHistory(opts, async ({ request, providerThread }) => {
+    const fork = await forkCodexHistoryOnConnection(opts, request, { cwd: opts.cwd, ...providerThread });
     return { resumeSessionId: fork.resumeSessionId };
   });
 }
