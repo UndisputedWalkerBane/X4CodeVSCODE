@@ -179,11 +179,48 @@ test("ordinary steer and delayed queued sends retain the profile and record orig
 });
 
 const attachment = { name: "notes.txt", path: "/fixture/notes.txt" };
+
+test("desktop and mobile keep image drafts out of the text-only model's after-turn queue", t => {
+  for (const component of [ChatTile, RemoteChatTile]) {
+    const h = setup(t, component);
+    const image = { name: "capture.JPEG", path: "/fixture/capture.JPEG" };
+    const origin = { ...primary, ...pinned, apiProfileModel: "abliterated-model-large-v2" };
+    h.event(origin);
+    h.event({ type: "busy", value: true });
+    h.find(node => node.props.role === "radio" && textOf(node).includes("после")).props.onClick();
+    h.render();
+    h.draft("  Сравни с описанием  ");
+    h.event({ type: "attachmentAdded", files: [image, attachment] });
+    assert.equal(h.button("⏳ В очередь").props.disabled, true);
+    h.composer().props.onKeyDown({ key: "Enter", preventDefault() {} });
+    h.render();
+    assert.equal(h.composer().props.value, "  Сравни с описанием  ");
+    assert.ok(h.find(node => node.props["aria-label"] === "Открыть capture.JPEG"));
+    assert.ok(h.find(node => node.props["aria-label"] === "Открыть notes.txt"));
+    assert.match(textOf(h.find(node => node.props.role === "alert")), /abliterated-model-large-v2/);
+    assert.equal(h.find(node => node.props.className?.includes("queue-chip")), undefined);
+    h.event({ type: "busy", value: false });
+    h.event({ ...origin, apiProfileModel: "abliterated-model-large-flash" });
+    h.click("Отправить");
+    assert.deepEqual(commands.at(-1).attachments, [image, attachment]);
+  }
+});
+
 function confirmApiSetting(h, request = commands.at(-1)) {
   assert.equal(request.type, "applyApiModelSetting");
   assert.ok(request.requestId);
   h.deliver({ ...request, type: "apiModelSettingSaved", ok: true });
 }
+
+test("the text-only composer accepts extensionless dotfiles on POSIX and Windows paths", t => {
+  const h = setup(t);
+  h.event({ ...primary, ...pinned, apiProfileModel: "abliterated-model-large" });
+  const files = [{ name: ".png", path: "/fixture/.png" }, { name: ".PNG", path: "C:\\fixture\\.PNG" },
+    { name: ".PNG", path: "C:\\fixture\\.agent-hub\\attachments\\2026-03-03T13-24-58-12345678-4321-4321-8123-0123456789ab-.PNG" }];
+  h.event({ type: "attachmentAdded", files });
+  h.click("Отправить");
+  assert.deepEqual(commands.at(-1).attachments, files);
+});
 
 for (const [surface, Component, chatId] of [["desktop", ChatTile], ["tile", ChatTile, "model-tile"], ["mobile", RemoteChatTile]]) {
   test(`${surface} changes model and effort for the bound API record and preserves the composer`, t => {
@@ -352,6 +389,26 @@ const rejected = message => ({ type: "sendRejected", requestId: message.requestI
   path: message.path, ...(message.chatId && { chatId: message.chatId }), error: "Missing API key" });
 const echoes = message => ({ type: "userMessage", requestId: message.requestId, recordId: message.recordId,
   path: message.path, ...(message.chatId && { chatId: message.chatId }), text: message.text });
+
+test("correcting a rejected image draft clears the host warning for that submission", t => {
+  for (const correction of ["remove", "model", "text"]) {
+    const h = setup(t);
+    const origin = { ...primary, ...pinned, apiProfileModel: "abliterated-model" };
+    const image = { name: "capture.png", path: "/capture.png" };
+    h.event(origin); h.draft("Опиши файл"); h.event({ type: "attachmentAdded", files: [image] });
+    h.click("Отправить");
+    const error = "Удалите изображение или выберите модель с поддержкой изображений.";
+    h.deliver({ ...rejected(commands.at(-1)), error });
+    assert.ok(textOf(h.tree).includes(error));
+    if (correction === "remove") {
+      h.find(node => node.props["aria-label"] === "Убрать вложение capture.png").props.onClick();
+      h.render();
+    } else if (correction === "model") h.event({ ...origin, apiProfileModel: "abliterated-model-large-flash" });
+    else h.draft("Исправленный запрос");
+    assert.equal(textOf(h.tree).includes(error), false, correction);
+    assert.equal(h.button("Отправить").props.disabled, false);
+  }
+});
 
 test("a pre-echo failure restores exact text and attachments only to the submitting tile without sending", t => {
   const chatId = "api-restore-tile", recordId = "external-record";

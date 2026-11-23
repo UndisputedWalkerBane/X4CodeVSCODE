@@ -1,0 +1,6 @@
+[
+  { "id": "abliterated-model", "images": true, "efforts": ["none", "minimal", "low", "medium", "high", "xhigh"] },
+  { "id": "abliterated-model-large-flash", "images": true, "efforts": ["none", "low", "high", "max"] },
+  { "id": "abliterated-model-large-v2", "images": false, "efforts": ["low", "high", "max"] },
+  { "id": "abliterated-model-large", "images": false, "efforts": ["none", "high", "max"] }
+]

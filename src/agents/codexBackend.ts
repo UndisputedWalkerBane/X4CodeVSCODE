@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions } from "./types";
-import { codexLaunch } from "./apiProviderLaunch";
+import { type CodexInferenceLaunch, withCodexInferenceLaunch } from "./apiProviderLaunch";
+import { CodexTurnErrors } from "./codexTurnErrors";
 import { createLiveAccessBridge } from "../liveAccessEnvironment";
 
 /**
@@ -343,14 +344,14 @@ async function readCodexQuestions(
 export class CodexBackend implements AgentBackend {
   readonly id = "codex";
 
-  async *start(prompt: string, opts: StartOptions): AsyncIterable<AgentEvent> {
-    yield* withCodexLiveAccess(opts, (options, children) => this.startProcess(prompt, options, children));
+  async *start(prompt: string, opts: StartOptions, preparedCatalog?: string): AsyncIterable<AgentEvent> {
+    yield* withCodexLiveAccess(opts, (options, children) =>
+      withCodexInferenceLaunch(options, launch => this.startProcess(prompt, options, launch, children), preparedCatalog));
   }
 
-  private async *startProcess(prompt: string, opts: StartOptions, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
+  private async *startProcess(prompt: string, opts: StartOptions, launch: CodexInferenceLaunch, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
     const sandbox = cfg.sandbox || "workspace-write";
-    const launch = codexLaunch(cfg, opts.extraEnv);
     const modelFlags = [
       ...launch.args,
       ...(cfg.model && !cfg.apiProvider ? ["-m", cfg.model] : []),
@@ -431,6 +432,7 @@ export class CodexBackend implements AgentBackend {
 
     const startedAt = Date.now();
     const seenItems = new Set<string>();
+    let turnErrors = new CodexTurnErrors();
     let finished = false;
     let executionStarted = false;
     let threadId: string | null = opts.resumeSessionId ?? null;
@@ -470,6 +472,7 @@ export class CodexBackend implements AgentBackend {
           }
 
           case "turn.started":
+            turnErrors = new CodexTurnErrors();
             yield { kind: "activity", label: "Думает…" };
             break;
 
@@ -562,17 +565,17 @@ export class CodexBackend implements AgentBackend {
           case "turn.failed": {
             finished = true;
             const err = ev.error as { message?: string } | undefined;
-            yield { kind: "error", message: launch.redact(err?.message ?? "Codex: ход завершился с ошибкой") };
+            const error = turnErrors.take(launch.redact(err?.message ?? "Codex: ход завершился с ошибкой"));
+            if (error) yield error;
             yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
             break;
           }
 
-          case "error":
-            yield {
-              kind: "error",
-              message: launch.redact(typeof ev.message === "string" ? ev.message : "Codex: ошибка"),
-            };
+          case "error": {
+            const error = turnErrors.take(launch.redact(typeof ev.message === "string" ? ev.message : "Codex: ошибка"));
+            if (error) yield error;
             break;
+          }
         }
       }
 

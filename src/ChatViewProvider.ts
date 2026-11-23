@@ -24,12 +24,13 @@ import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
+import { isImageAttachment, prefixedAttachmentName } from "./shared/attachments";
 import { deleteProjectAccess, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, resolveProjectAccessConnection, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
 import type { ProjectAccessProtocol, ProjectAccessSummary } from "./shared/projectAccesses";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { ApiProviderProfileStore, type ApiProviderProfile } from "./apiProviderProfiles";
-import { ABLITERATION_MODELS, apiEffortLevels, isValidApiModelId } from "./apiModelParameters";
+import { ABLITERATION_MODELS, apiEffortLevels, apiImageInputError, isValidApiModelId } from "./apiModelParameters";
 import { fetchApiModelIds } from "./apiProviderModels";
 import { manageApiProviderSettings } from "./apiProviderSettings";
 import { CompactModeController } from "./compactMode";
@@ -241,16 +242,10 @@ const DEFAULT_CLAUDE_COMMANDS: SlashCommandInfo[] = [
   { name: "usage", description: "Использование лимитов подписки" },
 ];
 
-const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
-
-function isImagePath(p: string): boolean {
-  return IMAGE_EXT.has(nodePath.extname(p).toLowerCase());
-}
-
 /** Блок «Приложенные файлы» перед текстом пользователя. */
 function buildAttachmentsBlock(attachments: Attachment[]): string {
   const lines = attachments.map(
-    (a) => `- ${a.path}${isImagePath(a.path) ? " (изображение — открой и рассмотри)" : ""}`,
+    (a) => `- ${a.path}${isImageAttachment(a.path) ? " (изображение — открой и рассмотри)" : ""}`,
   );
   return `Приложенные файлы:\n${lines.join("\n")}`;
 }
@@ -3206,6 +3201,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return record?.modelOverrides?.[agent] || vscode.workspace.getConfiguration(`agentHub.${agent}`).get<string>("model", "") || "";
   }
 
+  private attachmentInputError(record: SessionRecord | null | undefined, attachments: Attachment[]) {
+    if (!Array.isArray(attachments) || attachments.some(file => typeof file?.path !== "string" || typeof file?.name !== "string")) {
+      return "Некорректные вложения сообщения.";
+    }
+    if (record?.apiProfile && attachments.length) {
+      return apiImageInputError(record.apiProfile.id, this.selectedModel(record, "codex"), attachments.some(file => isImageAttachment(file.path)));
+    }
+  }
+
   private postRecordModel(projectPath: string, record: SessionRecord | null | undefined, agent: AgentId, chatId?: string) {
     const fallbackFrom = record?.apiProfile && agent === "codex" ? undefined : record?.modelFallbacks?.[agent];
     const model = fallbackFrom && record?.models?.[agent]
@@ -3505,6 +3509,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (message.kind !== "prompt" || message.editUnavailableReason || message.logCut === undefined || message.logCut < 0) throw new Error(message.editUnavailableReason ?? "Для этого сообщения не сохранена точная граница контекста.");
         if (typeof msg.text !== "string" || (!msg.text.trim() && !msg.attachments?.length) || !Array.isArray(msg.attachments) || msg.attachments.length > 100 ||
             msg.attachments.some(file => !file || typeof file.name !== "string" || typeof file.path !== "string" || !file.path || !nodePath.isAbsolute(file.path))) throw new Error("Некорректный текст или вложения сообщения.");
+        const attachmentError = this.attachmentInputError(record, msg.attachments);
+        if (attachmentError) throw new Error(attachmentError);
         for (const file of msg.attachments) {
           try { if (!fs.statSync(file.path).isFile()) throw new Error("not a file"); }
           catch { throw new Error(`Вложение «${file.name}» недоступно. Удалите его или выберите файл заново.`); }
@@ -5169,6 +5175,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         const project = this.getProjects().find((p) => projectKey(p) === target);
         if (!project) { reject("Проект больше недоступен."); break; }
+        const attachmentError = this.attachmentInputError(record, msg.attachments ?? []);
+        if (attachmentError) { reject(attachmentError); break; }
         let files: Attachment[], sentMessage: SentUserMessage | undefined;
         const recordGen = record?.createdAt;
         const acceptedSessionId = record?.agentIds[msg.agent];
@@ -5424,7 +5432,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!this.attachmentBindingCurrent(binding, chatId, draftContext)) return;
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const safeName = name.replace(/[^\wа-яА-ЯёЁ.\-]+/g, "_") || "file";
-      const filePath = nodePath.join(dir, `${stamp}-${randomUUID()}-${safeName}`);
+      const filePath = nodePath.join(dir, prefixedAttachmentName(`${stamp}-${randomUUID()}`, safeName));
       await fs.promises.writeFile(filePath, Buffer.from(dataBase64, "base64"));
       if (!this.attachmentBindingCurrent(binding, chatId, draftContext)) return;
       this.postScoped(projectKey(project), {
@@ -5475,7 +5483,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       try {
         const dir = nodePath.join(cwd, ".agent-hub", "attachments");
         await fs.promises.mkdir(dir, { recursive: true });
-        const dest = nodePath.join(dir, `${randomUUID()}-${nodePath.basename(a.path)}`);
+        const dest = nodePath.join(dir, prefixedAttachmentName(randomUUID(), nodePath.basename(a.path)));
         await fs.promises.copyFile(a.path, dest);
         out.push({ name: a.name, path: dest });
         this.postScoped(eventKey, {
@@ -5803,6 +5811,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    let addressedRecord: SessionRecord | undefined;
+    try {
+      const store = this.getProjectStore(cwd);
+      addressedRecord = store.sessions.find(item => item.id === (slot?.recordId ?? store.activeId));
+    } catch {
+      reject("Не удалось прочитать историю чата.");
+      return;
+    }
+    if (expectedBinding && !matchesSendBinding(addressedRecord, expectedBinding)) {
+      reject("Чат или API-провайдер изменился. Сообщение не отправлено.");
+      return;
+    }
+    if (!addressedRecord && slot) {
+      reject("Сессия чата удалена из истории.");
+      return;
+    }
+    const attachmentError = this.attachmentInputError(addressedRecord, attachments);
+    if (attachmentError) { reject(attachmentError); return; }
+
     const directory = physicalDirectory(workingDir);
     const directoryRuns = (this.directoryRuns ??= new Map());
     const group = directoryRuns.get(directory) ?? { controllers: new Set<AbortController>(), overlapped: false };
@@ -5833,17 +5860,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
 
     // Новая сессия — карточка проекта + контекст из журнала (общая память).
-    const store = this.getProjectStore(cwd);
-    let record = store.sessions.find(item => item.id === (slot?.recordId ?? store.activeId));
-    if (expectedBinding && !matchesSendBinding(record, expectedBinding)) {
-      emit({ type: "error", message: "Чат или API-провайдер изменился. Сообщение не отправлено." });
-      return;
-    }
-    if (!record && slot) {
-      emit({ type: "error", message: "Сессия чата удалена из истории." });
-      return;
-    }
-    record ??= await this.ensureActiveRecord(cwd);
+    const record = addressedRecord ?? await this.ensureActiveRecord(cwd);
     Object.assign(liveAccess, { recordId: record.id, createdAt: record.createdAt, agent });
     const writerKeys = [`record:${cwd}:${record.id}:${agent}`];
     if (record.agentIds[agent]) writerKeys.push(`session:${agent}:${record.agentIds[agent]}`);
@@ -6057,7 +6074,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         extraEnv: { ...liveAccess.channel.current },
         liveAccess: liveAccess.channel,
         config,
-        attachments: attachments.map((a) => ({ path: a.path, isImage: isImagePath(a.path) })),
+        attachments: attachments.map((a) => ({ path: a.path, isImage: isImageAttachment(a.path) })),
         confirmTool: (toolName, input) => this.confirmTool(toolName, input, cwd, chatId, record.id),
       });
 

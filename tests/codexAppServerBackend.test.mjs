@@ -463,6 +463,46 @@ test("main failed completion emits its error and one unsuccessful result", async
   assert.equal(h.kills, 1);
 });
 
+test("a repeated image rejection shows one actionable error per turn and keeps retry notices", async (t) => {
+  const h = await launch(t);
+  const error = { message: 'unexpected status 400 Bad Request: {"error":{"code":"media_images_not_supported","param":"input.224.content.2","request_id":"req_test"}}' };
+  h.notify("error", { ...h.scope(), error, willRetry: true });
+  h.notify("error", { ...h.scope(), error, willRetry: false });
+  await h.steer.handler("next instruction", "now");
+  h.complete(h.turn, "interrupted");
+  await until(() => h.turnRequests().length === 2);
+  const newTurn = "second-main-turn";
+  h.acceptStart(h.turnRequests()[1], newTurn);
+  h.notify("error", { ...h.scope(newTurn), error, willRetry: false });
+  h.notify("turn/completed", { threadId: h.thread, turn: { id: newTurn, status: "failed", error } });
+  await h.run;
+  const errors = h.events.filter((event) => event.kind === "error");
+  assert.equal(errors.length, 2, "the previous turn and the failed turn each show the error once");
+  for (const event of errors) {
+    assert.equal(event.code, "media_images_not_supported");
+    assert.match(event.message, /модель с поддержкой изображений/iu);
+    assert.match(event.message, /req_test/);
+  }
+  assert.ok(h.events.some((event) => event.kind === "notice" && event.text.includes("повторяет")));
+  assert.equal(h.events.filter((event) => event.kind === "result" && !event.ok).length, 1);
+});
+
+test("different wrappers for a rejected image preserve one diagnostic per known request ID", async (t) => {
+  const h = await launch(t);
+  for (const requestId of ["req_first", "req_second"]) {
+    const error = { message: JSON.stringify({ error: { code: "media_images_not_supported", request_id: requestId } }) };
+    h.notify("error", { ...h.scope(), error, willRetry: false });
+  }
+  h.notify("error", { ...h.scope(), error: { message: "This model does not accept image inputs." }, willRetry: false });
+  h.notify("turn/completed", { threadId: h.thread, turn: { id: h.turn, status: "failed",
+    error: { message: "API error: This model does not accept image inputs. Request ID: req_second" } } });
+  await h.run;
+  const errors = h.events.filter((event) => event.kind === "error");
+  assert.equal(errors.length, 2);
+  assert.match(errors[0].message, /req_first/);
+  assert.match(errors[1].message, /req_second/);
+});
+
 test("start failure settles queued server requests and returns an unsuccessful result", async (t) => {
   const h = await launch(t, { start: false });
   h.send({ id: 100, method: "item/commandExecution/requestApproval", params: { ...h.scope(), command: "early" } });

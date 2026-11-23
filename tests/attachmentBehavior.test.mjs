@@ -253,3 +253,13 @@ test("a successful replacement retry clears the edit composer's previous upload 
   h.click("Заменить original.PNG"); h.chooseReplacement(new File(["image"], "new.png")); const request = await h.resolve(); h.ack(request);
   assert.equal(nodes(h.tree).some(node => node.props?.role === "alert"), false);
 });
+
+test("removing the rejected image clears the sent-message edit error and preserves its text", () => {
+  const h = harness(); h.beginEdit(); h.click("Сохранить и отправить");
+  const submission = commands.at(-1), error = "Удалите изображение или выберите другую модель.";
+  h.event({ type: "editMessageResult", requestId: submission.requestId, sourceRecordId: submission.recordId, ok: false, error });
+  assert.ok(textOf(h.tree).includes(error));
+  h.click("Убрать вложение original.PNG");
+  assert.equal(textOf(h.tree).includes(error), false);
+  assert.equal(h.field("Редактируемое сообщение").props.value, submission.text);
+});

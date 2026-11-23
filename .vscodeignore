@@ -5,8 +5,12 @@ esbuild.mjs
 tsconfig.json
 tests/**
 .gitignore
+.gitattributes
 ai-dev-environment.md
 dist/**/*.map
 **/*.vsix
 mobile/**
 .github/**
+
+resources/*.mjs
+resources/codex/prompt.md

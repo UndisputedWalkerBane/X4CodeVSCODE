@@ -80,8 +80,7 @@ export type AgentEvent =
   | {
       kind: "error";
       message: string;
-      /** Codex: тред занят другим процессом (thread-store conflict). */
-      code?: "codexWriterConflict";
+      code?: "codexWriterConflict" | "media_images_not_supported";
       threadId?: string;
     };
 

@@ -26,7 +26,8 @@ import type {
 } from "../src/shared/protocol";
 
 import { projectKey } from "../src/shared/projectIdentity";
-import { isValidApiModelId } from "../src/apiModelParameters";
+import { isImageAttachment } from "../src/shared/attachments";
+import { apiImageInputError, isValidApiModelId } from "../src/apiModelParameters";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
 import { TaskCheckpoint, type TaskSnapshot } from "./TaskCheckpoint";
 import { ProjectAccesses, type ProjectAccessSnapshot, type ProjectAccessTestResult } from "./ProjectAccesses";
@@ -220,8 +221,6 @@ interface TextAttachmentDraft {
 }
 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-// Keep the extensions aligned with the provider's image classification.
-const isImageAttachment = (path: string) => /\.(?:png|jpe?g|gif|webp|bmp)$/i.test(path);
 
 function addUploadedFiles(current: Attachment[], files: Attachment[], originalPath?: string): Attachment[] {
   if (!originalPath) return [...current, ...files.filter(file => !current.some(existing => existing.path === file.path))];
@@ -396,6 +395,11 @@ function ChatTile({
     messageEditRef.current = value;
     setMessageEdit(value);
   }, []);
+  useEffect(() => {
+    setSendError("");
+    const edit = messageEditRef.current;
+    if (edit?.phase === "ready" && edit.error) updateMessageEdit({ ...edit, error: undefined });
+  }, [apiBinding.apiProfileId, apiBinding.apiProfileModel, updateMessageEdit]);
   const [messageEditError, setMessageEditError] = useState<{ messageId: string; text: string } | null>(null);
   const normalAttachmentDraftRef = useRef(draftId());
   const filePickerTargetRef = useRef<AttachmentTarget | null>(null);
@@ -477,21 +481,27 @@ function ChatTile({
   const [pendingBy, setPendingBy] = useState<Record<string, Attachment[]>>({});
   const normalPending = pendingBy[activePath] ?? [];
   const pending = messageEdit ? messageEdit.attachments : normalPending;
+  const imageInputError = apiImageInputError(apiBinding.apiProfileId, apiBinding.apiProfileModel, pending.some(file => isImageAttachment(file.path)));
+  const apiSendBlocked = !!apiPicker || !!imageInputError;
   const composerDraft = messageEdit ? messageEdit.text : draft;
   const updateComposerDraft = (text: string) => {
     const edit = messageEditRef.current;
     if (edit) {
-      if (edit.phase === "ready") updateMessageEdit({ ...edit, text });
+      if (edit.phase === "ready") updateMessageEdit({ ...edit, text, error: undefined });
     } else {
       restoreIntoEmptyComposer.current = undefined;
+      setSendError("");
       setDraft(text);
     }
   };
   const setPending = (fn: (prev: Attachment[]) => Attachment[]) => {
     const edit = messageEditRef.current;
     if (edit) {
-      if (edit.phase === "ready") updateMessageEdit({ ...edit, attachments: fn(edit.attachments) });
-    } else setPendingBy((prev) => ({ ...prev, [activePath]: fn(prev[activePath] ?? []) }));
+      if (edit.phase === "ready") updateMessageEdit({ ...edit, attachments: fn(edit.attachments), error: undefined });
+    } else {
+      setSendError("");
+      setPendingBy((prev) => ({ ...prev, [activePath]: fn(prev[activePath] ?? []) }));
+    }
   };
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [form, setForm] = useState<SettingsSnapshot | null>(null);
@@ -1096,6 +1106,7 @@ function ChatTile({
                 break;
               }
               updateMessageEdit({ ...edit, attachments: addUploadedFiles(edit.attachments, msg.files, upload?.originalPath),
+                error: undefined,
                 missingAttachments: edit.missingAttachments.filter((name) => !msg.files.some((file) => file.name === name)),
                 pendingUploads: edit.pendingUploads.filter((uploadId) => uploadId !== context.uploadId) });
               if (upload) finishAttachmentUpload(upload.id);
@@ -1109,6 +1120,7 @@ function ChatTile({
             break;
           }
           restoreIntoEmptyComposer.current = undefined;
+          setSendError("");
           setPendingBy((prev) => {
             const cur = prev[target] ?? [];
             return {
@@ -1459,7 +1471,7 @@ function ChatTile({
   };
 
   const send = () => {
-    if (apiPicker) return;
+    if (apiSendBlocked) return;
     const edit = messageEditRef.current;
     if (edit) {
       if (edit.phase !== "ready" || !editMatchesSource(edit) || busyRef.current[edit.path] || !agentReady ||
@@ -2871,7 +2883,7 @@ function ChatTile({
             <span className="message-edit-missing-hint">Прикрепите эти файлы заново или уберите их перед сохранением.</span>
           </div>
         ) : null}
-        {sendError && <div className="message-edit-error" role="alert">{sendError}</div>}
+        {(imageInputError || sendError) && <div className="message-edit-error" role="alert">{imageInputError || sendError}</div>}
         {!messageEdit && rejectedDrafts.filter(entry => entry.path === activePath && entry.recordId === bindingRef.current.recordId)
           .map(entry => (
             <div key={entry.requestId} className="message-edit-banner">
@@ -3134,7 +3146,7 @@ function ChatTile({
                   onClick={() => requestMessageEdit(messageEdit)}>Загрузить снова</button>
               ) : (
                 <button type="button" className="send" onClick={send}
-                  disabled={!!apiPicker || editBlocked || editFormDisabled || !!messageEdit.missingAttachments.length ||
+                  disabled={apiSendBlocked || editBlocked || editFormDisabled || !!messageEdit.missingAttachments.length ||
                     !!messageEdit.pendingUploads.length || (!composerDraft.trim() && !pending.length)}>
                   {messageEdit.phase === "saving" ? "Сохраняю…" : "Сохранить и отправить"}
                 </button>
@@ -3152,7 +3164,7 @@ function ChatTile({
                       : "Сообщение отправится автоматически после ответа агента"
                 }
                 onClick={send}
-                disabled={!!apiPicker || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}
+                disabled={apiSendBlocked || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}
               >
                 {sendMode === "now" ? "⚡ Сразу" : sendMode === "next" ? "↪ Докинуть" : "⏳ В очередь"}
               </button>
@@ -3168,7 +3180,7 @@ function ChatTile({
               </button>
             </>
           ) : (
-            <button className="send" onClick={send} disabled={!!apiPicker || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}>
+            <button className="send" onClick={send} disabled={apiSendBlocked || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}>
               Отправить
             </button>
           )}

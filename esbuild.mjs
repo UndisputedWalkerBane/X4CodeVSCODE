@@ -1,12 +1,23 @@
 import * as esbuild from "esbuild";
 
+import { catalogInputs, renderAbliterationCatalog } from "./resources/abliterationCatalog.mjs";
+
 const watch = process.argv.includes("--watch");
 
 /** Сборка extension host: Node.js, CommonJS. SDK не бандлим — он спавнит CLI из
  *  собственного пакета и должен остаться обычной зависимостью в node_modules. */
 const extensionCtx = await esbuild.context({
-  entryPoints: ["src/extension.ts"],
-  outfile: "dist/extension.js",
+  entryPoints: { extension: "src/extension.ts", "abliteration-models": "abliteration-models.json" },
+  outdir: "dist",
+  plugins: [{
+    name: "codex-model-catalog",
+    setup(build) {
+      build.onResolve({ filter: /^abliteration-models\.json$/ }, args => ({ path: args.path, namespace: "catalog" }));
+      build.onLoad({ filter: /.*/, namespace: "catalog" }, async () => ({
+        contents: await renderAbliterationCatalog(), loader: "copy", watchFiles: catalogInputs,
+      }));
+    },
+  }],
   bundle: true,
   platform: "node",
   format: "cjs",

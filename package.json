@@ -2,7 +2,7 @@
   "name": "agent-hub",
   "displayName": "Agent Hub",
   "description": "Claude Code, GPT и сторонние модели через Responses API в чатах VS Code с историей проектов и подтверждениями действий",
-  "version": "0.0.72",
+  "version": "0.0.73",
   "publisher": "marse",
   "license": "UNLICENSED",
   "private": true,

@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
 import type { AgentBackend, AgentEvent, StartOptions, PrepareEditOptions, PreparedEdit } from "./types";
-import { codexLaunch, verifyCodexProvider } from "./apiProviderLaunch";
+import { type CodexInferenceLaunch, verifyCodexProvider, withCodexInferenceLaunch } from "./apiProviderLaunch";
+import { CodexTurnErrors } from "./codexTurnErrors";
 import { createLiveAccessBridge } from "../liveAccessEnvironment";
 import {
   CodexBackend,
@@ -105,34 +106,34 @@ export class CodexAppServerBackend implements AgentBackend {
   private async *startRun(prompt: string, opts: StartOptions, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const startedAt = Date.now();
     try {
-      yield* this.startAttempt(prompt, opts, { kind: "initial", startedAt }, ownedChildren);
+      yield* withCodexInferenceLaunch(opts, launch => this.startWithRecovery(prompt, opts, launch, startedAt, ownedChildren));
     } catch (err) {
       if (opts.signal.aborted) return;
-      // startAttempt has confirmed its child stopped and finished all cleanup.
-      // A timeout after turn/start is ambiguous and can never reach this path.
-      if (err instanceof StartupRequestTimeoutError && err.method === "thread/resume" && opts.resumeSessionId) {
-        try {
-          yield {
-            kind: "notice",
-            text: "⚠️ thread/resume Codex не ответил за 60 с. Копирую всю сохранённую историю в отдельный тред и проверяю её перед продолжением. Исходный чат сохранён.",
-          };
-          if (opts.signal.aborted) return;
-          yield* this.startAttempt(prompt, opts, {
-            kind: "resumeRecovery", sourceSessionId: opts.resumeSessionId, startedAt,
-          }, ownedChildren);
-          return;
-        } catch (recoveryError) {
-          if (opts.signal.aborted) return;
-          err = recoveryError;
-        }
-      }
       const message = err instanceof Error ? err.message : String(err);
       yield { kind: "error", message: `Codex: не удалось продолжить с сохранённой историей: ${message}` };
       yield { kind: "result", ok: false, durationMs: Date.now() - startedAt };
     }
   }
 
-  private async *startAttempt(prompt: string, opts: StartOptions, context: StartAttemptContext, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
+  private async *startWithRecovery(prompt: string, opts: StartOptions, launch: CodexInferenceLaunch,
+    startedAt: number, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
+    try {
+      yield* this.startAttempt(prompt, opts, launch, { kind: "initial", startedAt }, ownedChildren);
+    } catch (err) {
+      if (opts.signal.aborted) return;
+      // Only a timeout before turn/start is safe to recover. startAttempt has stopped its child.
+      if (!(err instanceof StartupRequestTimeoutError && err.method === "thread/resume" && opts.resumeSessionId)) throw err;
+      yield {
+        kind: "notice",
+        text: "⚠️ thread/resume Codex не ответил за 60 с. Копирую всю сохранённую историю в отдельный тред и проверяю её перед продолжением. Исходный чат сохранён.",
+      };
+      if (!opts.signal.aborted) yield* this.startAttempt(prompt, opts, launch, {
+        kind: "resumeRecovery", sourceSessionId: opts.resumeSessionId, startedAt,
+      }, ownedChildren);
+    }
+  }
+
+  private async *startAttempt(prompt: string, opts: StartOptions, launch: CodexInferenceLaunch, context: StartAttemptContext, ownedChildren?: Set<ChildProcess>): AsyncIterable<AgentEvent> {
     const cfg = opts.config;
     const sandbox = cfg.yolo ? "danger-full-access" : cfg.sandbox || "workspace-write";
     const startedAt = context.startedAt;
@@ -145,7 +146,6 @@ export class CodexAppServerBackend implements AgentBackend {
     }
     if (opts.signal.aborted) return;
 
-    const launch = codexLaunch(cfg, opts.extraEnv);
     const child = spawn("codex", ["app-server", ...launch.args, ...(opts.liveAccess ? ["--disable", "shell_snapshot"] : []), "--listen", "stdio://"], {
       cwd: opts.cwd,
       env: launch.env,
@@ -223,6 +223,11 @@ export class CodexAppServerBackend implements AgentBackend {
     let restartWith: string | null = null;
     const seenItems = new Set<string>();
     const deltaItems = new Set<string>();
+    let turnErrors = new CodexTurnErrors();
+    const reportTurnError = (message: string) => {
+      const error = turnErrors.take(launch.redact(message));
+      if (error) emit(error);
+    };
     /** Между двумя сообщениями агента подряд нужен разрыв абзаца. */
     let needBreak = false;
     const stderrChunks: string[] = [];
@@ -246,6 +251,7 @@ export class CodexAppServerBackend implements AgentBackend {
       turnId = null;
       seenItems.clear();
       deltaItems.clear();
+      turnErrors = new CodexTurnErrors();
       earlyNotifications = [];
       let ready!: () => void;
       const starting = new Promise<void>((resolve) => { ready = resolve; });
@@ -412,9 +418,9 @@ export class CodexAppServerBackend implements AgentBackend {
         }
         case "error": {
           const e = p.error as { message?: string } | undefined;
-          const text = launch.redact(e?.message ?? "Codex: ошибка");
-          if (p.willRetry) emit({ kind: "notice", text: `Codex: ${text} — повторяет…` });
-          else emit({ kind: "error", message: text });
+          const message = e?.message ?? "Codex: ошибка";
+          if (p.willRetry) emit({ kind: "notice", text: `Codex: ${launch.redact(message)} — повторяет…` });
+          else reportTurnError(message);
           break;
         }
         case "thread/compacted":
@@ -435,7 +441,7 @@ export class CodexAppServerBackend implements AgentBackend {
             break;
           }
           if (t.status === "failed") {
-            emit({ kind: "error", message: launch.redact(t.error?.message ?? "Codex: ход завершился с ошибкой") });
+            reportTurnError(t.error?.message ?? "Codex: ход завершился с ошибкой");
           }
           emit({
             kind: "result",
@@ -624,7 +630,7 @@ export class CodexAppServerBackend implements AgentBackend {
             kind: "notice",
             text: `codex app-server недоступен (${message.slice(0, 120)}) — ход выполняется через exec, без корректировки на лету.`,
           };
-          yield* this.exec.start(prompt, opts);
+          yield* this.exec.start(prompt, opts, launch.catalogPath);
           return;
         }
         yield { kind: "error", message: `Codex: ${message}` };

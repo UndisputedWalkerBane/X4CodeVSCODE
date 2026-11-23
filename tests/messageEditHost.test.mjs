@@ -93,6 +93,127 @@ test("prepare uses host-owned text and attachments and never forks the provider"
   assert.equal(h.prepared().at(-1)?.text, "Original selected"); assert.equal(h.prepared().at(-1)?.agent, "codex"); assert.deepEqual(h.prepares, []);
 });
 
+async function imageInputSetup(model, profileId = "abliteration") {
+  const h = await editSetup();
+  const profile = { id: profileId, name: "Test provider", baseUrl: "https://example.invalid/v1", model };
+  h.record().apiProfile = profile;
+  h.p.apiProfileStore = { resolve: async () => profile };
+  const image = { name: "Кадр.PNG", path: join(h.projects[0].path, "Кадр.PNG") };
+  await writeFile(image.path, "fixture");
+  const send = { type: "send", path: h.projects[0].id, agent: "codex", recordId: h.record().id,
+    apiProfileId: profileId, requestId: "image-request", text: "Посмотри", attachments: [image] };
+  return { h, image, send };
+}
+
+test("text-only API sends, live steering and mobile edits reject images before saving or starting a turn", async () => {
+  for (const action of ["send", "steer", "editMessage"]) {
+    const { h, image, send } = await imageInputSetup("abliterated-model");
+    h.record().apiModelOverride = "abliterated-model-large-v2";
+    const record = structuredClone(h.record());
+    let steered = false;
+    const chatId = h.slots[0].chatId;
+    if (action === "steer") {
+      h.p.runs.set(chatId, new AbortController());
+      h.p.steers.set(chatId, { handler: async () => { steered = true; } });
+      await h.send({ ...send, chatId, type: action, mode: "next" });
+    } else if (action === "editMessage") {
+      await h.p.onMessage(h.edit({ requestId: send.requestId, chatId: undefined, attachments: [image] }), "remote");
+    } else {
+      await h.p.onMessage(send, "remote");
+    }
+    const response = h.messages.find(m => m.requestId === send.requestId);
+    assert.equal(response?.type, action === "editMessage" ? "editMessageResult" : "sendRejected", action);
+    assert.equal(response.recordId ?? response.sourceRecordId, record.id);
+    assert.match(response.error, /abliterated-model-large-v2/);
+    assert.match(response.error, /изображени/i);
+    assert.match(response.error, /удалите/i);
+    assert.equal(steered, false);
+    assert.deepEqual(h.prepares, []);
+    assert.deepEqual(h.calls, []);
+    assert.deepEqual(h.record(), record);
+    assert.equal(h.messages.some(m => m.type === "busy" && m.value || m.type === "userMessage"), false);
+  }
+});
+
+test("text-only defaults admit ordinary files and exact model overrides preserve image-capable or unknown routes", async () => {
+  for (const [profileId, model, override, imageAllowed] of [
+    ["abliteration", "abliterated-model-large", undefined, false],
+    ["abliteration", "abliterated-model-large", "abliterated-model-large-flash", true],
+    ["abliteration", "abliterated-model", undefined, true],
+    ["abliteration", "abliterated-model-large-future", undefined, true],
+    ["other-provider", "abliterated-model-large-v2", undefined, true],
+  ]) {
+    const { h, send } = await imageInputSetup(model, profileId);
+    if (override) h.record().apiModelOverride = override;
+    if (!imageAllowed) {
+      await h.p.onMessage(send, "remote");
+      assert.match(h.messages.find(m => m.type === "sendRejected")?.error ?? "", /abliterated-model-large/);
+      send.attachments = [{ name: "kept.txt", path: h.file }];
+      send.requestId = "ordinary-file";
+    }
+    await h.p.onMessage(send, "remote");
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.calls[0].opts.attachments, [{ path: send.attachments[0].path, isImage: imageAllowed }]);
+  }
+});
+
+test("invalid remote attachments get a scoped rejection without committing the draft", async () => {
+  const { h, send } = await imageInputSetup("abliterated-model-large");
+  const record = structuredClone(h.record());
+  for (const attachments of [[null], [{ name: "broken.png", path: 42 }], "image.png"]) {
+    await h.p.onMessage({ ...send, attachments }, "remote");
+    assert.match(h.messages.at(-1)?.error ?? "", /вложени/i);
+    assert.equal(h.messages.at(-1).requestId, send.requestId);
+    assert.deepEqual(h.record(), record);
+    assert.deepEqual(h.calls, []);
+  }
+});
+
+test("the host classifies image extensions on the basename for both Windows and POSIX", async () => {
+  const { h, send } = await imageInputSetup("abliterated-model");
+  const files = [
+    ["/example/.png", false], ["C:\\example\\.PNG", false],
+    ["/example/.capture.WeBp", true], ["C:\\example\\.capture.JPEG", true],
+    ["/example/image.jpg/notes.txt", false], ["C:\\example\\image.jpg\\notes.txt", false],
+  ];
+  await h.p.onMessage({ ...send, attachments: files.map(([path]) => ({ name: path, path })) }, "remote");
+  assert.deepEqual(h.calls[0]?.opts.attachments, files.map(([path, isImage]) => ({ path, isImage })));
+});
+
+test("uploads and cross-project copies preserve dotfile image classification across stored filename formats", async () => {
+  const { h, send } = await imageInputSetup("abliterated-model");
+  delete h.p.relocateAttachments;
+  const foreign = h.projects[1];
+  foreign.path = join(temp, "foreign-attachments");
+  const directory = join(foreign.path, ".agent-hub", "attachments");
+  const data = Buffer.from("example").toString("base64");
+  const files = [];
+  for (const name of [".png", ".capture.png"]) {
+    await h.p.saveAttachment(name, data, foreign.id);
+    const saved = h.messages.findLast(m => m.type === "attachmentAdded").files[0];
+    assert.equal(dirname(saved.path), directory);
+    files.push(saved);
+  }
+  const stamp = "2026-03-03T13-24-58", uuid = "12345678-4321-4321-8123-0123456789ab";
+  for (const basename of [".png", stamp + "-.png", stamp + "-" + uuid + "-.png",
+    uuid + "-" + stamp + "-" + uuid + "-.png", stamp + "-" + uuid + "-.capture.png"]) {
+    const path = join(directory, basename);
+    await writeFile(path, "example");
+    files.push({ name: ".png", path });
+  }
+  // A renderer-controlled display name cannot turn an arbitrary image into a text attachment.
+  const outside = join(foreign.path, stamp + "-" + uuid + "-.png");
+  await writeFile(outside, "example"); files.push({ name: ".png", path: outside });
+  await h.p.onMessage({ ...send, attachments: files }, "remote");
+  const delivered = h.calls[0]?.opts.attachments;
+  assert.deepEqual(delivered?.map(file => file.isImage), [false, true, false, false, false, false, true, true]);
+  for (const file of delivered.slice(0, -1)) {
+    assert.equal(dirname(file.path), join(h.projects[0].path, ".agent-hub", "attachments"));
+    assert.equal(await readFile(file.path, "utf8"), "example");
+  }
+  assert.equal(delivered.at(-1).path, outside);
+});
+
 test("native prepare failure preserves original history and does not run a replacement", async () => {
   const h = await editSetup(); const before = structuredClone(h.record());
   h.p.backends.codex.prepareEdit = async () => { throw new Error("native prefix unavailable"); };

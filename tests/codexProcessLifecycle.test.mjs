@@ -165,6 +165,30 @@ test("exec consumes an already emitted close without hanging", async (t) => {
   assert.equal(result.at(-1).ok, false);
 });
 
+test("exec emits a distinct diagnostic once when turn.failed repeats the image rejection", async (t) => {
+  const c = child(t);
+  spawned = c;
+  const run = Array.fromAsync(new backend.CodexBackend().start("test", {
+    cwd: temp, config: { contextWindow: 0 }, signal: new AbortController().signal,
+  }));
+  const message = "This model does not accept image inputs. Send this request without images, or use a model that supports image input.";
+  c.stdout.write(JSON.stringify({ type: "error", message: "unrelated error" }) + "\n");
+  c.stdout.write(JSON.stringify({ type: "error", message }) + "\n");
+  c.stdout.write(JSON.stringify({ type: "error", message: "media_images_not_supported, request_id=req_first" }) + "\n");
+  c.stdout.write(JSON.stringify({ type: "turn.failed", error: { message: "media_images_not_supported, request_id=req_second" } }) + "\n");
+  c.stdout.end();
+  c.exit(1, null);
+  c.emit("close", 1);
+  const events = await run;
+  const errors = events.filter((event) => event.kind === "error");
+  assert.equal(errors.length, 3, "the ID-less notification matches the first identified rejection");
+  assert.deepEqual(errors[0], { kind: "error", message: "unrelated error" });
+  assert.equal(errors[1].code, "media_images_not_supported");
+  assert.match(errors[1].message, /модель с поддержкой изображений/iu);
+  assert.match(errors[2].message, /req_second/);
+  assert.equal(events.filter((event) => event.kind === "result" && !event.ok).length, 1);
+});
+
 test("cleanup cannot report a free thread if another owner replaced it while waiting", async (t) => {
   const c = child(t);
   backend.trackCodex("replaced", c);

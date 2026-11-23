@@ -1,0 +1,2 @@
+# Preserve the upstream Codex prompt byte-for-byte.
+resources/codex/prompt.md -text whitespace=-blank-at-eol linguist-vendored
