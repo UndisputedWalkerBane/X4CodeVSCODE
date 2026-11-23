@@ -72,7 +72,7 @@ function setup(t, Component = ChatTile, props = {}) {
     button(label) { return h.find(node => node.type === "button" && textOf(node).trim() === label); },
     change(value) { const provider = h.provider(); assert.equal(provider.props.disabled, false); provider.props.onChange({ target: { value } }); h.render(); },
     draft(value) { h.composer().props.onChange({ target: { value } }); h.render(); },
-    click(label) { const button = h.button(label); assert.ok(button, label); assert.equal(!!button.props.disabled, false, label); button.props.onClick(); h.render(); },
+    click(label) { const button = h.button(label); assert.ok(button, label); assert.equal(!!button.props.disabled, false, label); button.props.onClick({ currentTarget: { focus() {} } }); h.render(); },
   };
   h.render();
   h.event({ type: "projects", projects: [project], activePath: project.id });
@@ -97,8 +97,8 @@ test("single chat selects a named API only after its matching ack and restores n
   h.event({ ...primary, recordId: external.recordId });
   h.event({ type: "modelInfo", agent: "codex", model: "native-model" });
   assert.equal(h.provider().props.value, "api:abliteration");
-  assert.equal(h.button("saved-model").props.disabled, true);
-  assert.equal(h.button("⚡ effort: —").props.disabled, true);
+  assert.equal(h.button("saved-model").props.disabled, false);
+  assert.equal(h.button("⚡ Авто").props.disabled, false);
   h.click("Отправить");
   const { requestId, ...sent } = commands.at(-1);
   assert.equal(typeof requestId, "string");
@@ -179,6 +179,175 @@ test("ordinary steer and delayed queued sends retain the profile and record orig
 });
 
 const attachment = { name: "notes.txt", path: "/fixture/notes.txt" };
+function confirmApiSetting(h, request = commands.at(-1)) {
+  assert.equal(request.type, "applyApiModelSetting");
+  assert.ok(request.requestId);
+  h.deliver({ ...request, type: "apiModelSettingSaved", ok: true });
+}
+
+for (const [surface, Component, chatId] of [["desktop", ChatTile], ["tile", ChatTile, "model-tile"], ["mobile", RemoteChatTile]]) {
+  test(`${surface} changes model and effort for the bound API record and preserves the composer`, t => {
+    const recordId = "api-record", scope = { path: project.id, recordId, apiProfileId: profile.id, ...(chatId && { chatId }) };
+    const h = setup(t, Component, chatId ? { chatId, initialProjectPath: project.id, initialRecordId: recordId, initialAgent: "codex" } : {});
+    h.event({ ...primary, recordId, ...pinned, apiProfileEffort: "medium" });
+    h.draft("Мой черновик"); h.event({ type: "attachmentAdded", files: [attachment] });
+    h.click("saved-model");
+    const { requestId, ...request } = commands.at(-1);
+    assert.ok(requestId);
+    assert.deepEqual(request, { type: "apiModelSettings", ...scope, action: "model" });
+    const options = { ...request, type: "apiModelOptions", requestId, values: ["", "provider-first", "provider-second"], current: "" };
+    for (const mismatch of [{ recordId: "unrelated" }, { apiProfileId: other.id }, { path: "/other" },
+        { chatId: chatId ? undefined : "other-tile" }, { requestId: "expired" }, { action: "effort" }]) {
+      h.deliver({ ...options, ...mismatch });
+      assert.equal(h.find(node => node.type === "select" && node.props["aria-label"] === "Модель для этого чата"), undefined);
+    }
+    h.deliver(options);
+    const models = h.find(node => node.type === "select" && node.props["aria-label"] === "Модель для этого чата");
+    const modelChoices = nodes(models).filter(node => node.type === "option");
+    assert.deepEqual(modelChoices.slice(0, -1).map(node => node.props.value), options.values);
+    assert.equal(textOf(modelChoices.at(-1)), "Ввести ID вручную…");
+    models.props.onChange({ target: { value: "provider-second" } }); h.render(); h.click("Применить");
+    const { requestId: saveId, ...save } = commands.at(-1);
+    assert.deepEqual(save, { type: "applyApiModelSetting", ...scope, action: "model", value: "provider-second" });
+    assert.notEqual(saveId, requestId);
+    const ack = { ...save, type: "apiModelSettingSaved", ok: true, requestId: saveId };
+    for (const mismatch of [{ path: "other" }, { recordId: "other" }, { apiProfileId: other.id },
+        { action: "effort" }, { chatId: chatId ? undefined : "other-tile" }, { requestId: "old" }]) {
+      h.deliver({ ...ack, ...mismatch });
+      assert.ok(h.button("Применить").props.disabled);
+      assert.ok(h.button("Отправить").props.disabled);
+      h.button("Отправить").props.onClick(); h.render();
+      assert.equal(h.composer().props.value, "Мой черновик");
+    }
+    confirmApiSetting(h);
+    assert.equal(h.find(node => node.type === "dialog"), undefined);
+    h.event({ ...primary, recordId, ...pinned, apiProfileModel: "provider-second", apiProfileEffort: "medium" });
+    assert.ok(h.button("provider-second"));
+    h.event({ type: "effortInfo", agent: "codex", effort: "high", recordId });
+    h.event({ type: "effortInfo", agent: "codex", effort: "native-global" });
+    h.event({ type: "effortInfo", agent: "codex", effort: "old-record", recordId: "old" });
+    h.click("⚡ high");
+    const effortRequest = commands.at(-1);
+    assert.equal(effortRequest.action, "effort");
+    h.deliver({ ...effortRequest, type: "apiModelOptions", values: ["low", "high"], current: "high" });
+    const efforts = h.find(node => node.type === "select" && node.props["aria-label"] === "Уровень для этого чата");
+    assert.equal(efforts.props.value, "high");
+    assert.deepEqual(nodes(efforts).filter(node => node.type === "option").map(node => node.props.value), ["", "low", "high"]);
+    efforts.props.onChange({ target: { value: "" } }); h.render(); h.click("Применить");
+    const { requestId: effortSaveId, ...effortSave } = commands.at(-1);
+    assert.ok(effortSaveId);
+    assert.deepEqual(effortSave, { type: "applyApiModelSetting", ...scope, action: "effort", value: "" });
+    confirmApiSetting(h);
+    assert.equal(h.composer().props.value, "Мой черновик");
+    assert.ok(h.find(node => node.props["aria-label"] === "Открыть notes.txt"));
+    assert.equal(commands.some(message => ["pickModel", "pickEffort", "choose", "send"].includes(message.type)), false);
+  });
+}
+
+test("API catalog fallback accepts a typed model ID or profile reset, and abandons stale or busy pickers", t => {
+  const h = setup(t), recordId = "api-manual";
+  h.event({ ...primary, recordId, ...pinned });
+  const open = () => { h.click("saved-model"); return commands.at(-1); };
+  const first = open();
+  h.click("Отмена");
+  const second = open();
+  h.deliver({ ...first, type: "apiModelOptions", values: ["old"], current: "" });
+  assert.equal(h.button("Применить"), undefined);
+  const fallback = { type: "apiModelOptions", values: [""], current: "", notice: "Каталог недоступен" };
+  h.deliver({ ...second, ...fallback });
+  const modelInput = () => h.find(node => node.type === "input" && node.props["aria-label"] === "ID модели API");
+  assert.ok(textOf(h.tree).includes(fallback.notice));
+  modelInput().props.onChange({ target: { value: "  provider/manual  " } }); h.render(); h.click("Применить");
+  assert.equal(commands.at(-1).value, "provider/manual");
+  confirmApiSetting(h);
+  h.deliver({ ...open(), ...fallback, current: "old-custom-id" });
+  modelInput().props.onChange({ target: { value: "" } }); h.render(); h.click("Применить");
+  assert.equal(commands.at(-1).value, "");
+  confirmApiSetting(h);
+  const pending = open();
+  h.event({ type: "busy", value: true });
+  h.deliver({ ...pending, ...fallback });
+  assert.equal(h.find(node => node.type === "dialog"), undefined);
+  assert.equal(h.button("saved-model").props.disabled, true);
+  h.event({ type: "busy", value: false });
+  const beforeSwitch = open();
+  h.event({ ...primary, recordId: "native-next" });
+  h.deliver({ ...beforeSwitch, ...fallback });
+  assert.equal(h.find(node => node.type === "dialog"), undefined);
+});
+
+test("discovered and fallback lists offer manual model entry and validate typed IDs before applying", t => {
+  const h = setup(t);
+  h.event({ ...primary, recordId: "api-record", ...pinned });
+  for (const notice of [undefined, "Список из документации профиля"]) {
+    h.click("saved-model");
+    h.deliver({ ...commands.at(-1), type: "apiModelOptions", values: ["", "known"], current: "", notice });
+    const models = h.find(node => node.type === "select" && node.props["aria-label"] === "Модель для этого чата");
+    assert.ok(textOf(models).includes("known"));
+    const manualChoice = nodes(models).find(node => node.type === "option" && textOf(node) === "Ввести ID вручную…");
+    models.props.onChange({ target: { value: manualChoice.props.value } }); h.render();
+    const manual = () => h.find(node => node.type === "input" && node.props["aria-label"] === "ID модели API");
+    manual().props.onChange({ target: { value: "bad model" } }); h.render();
+    assert.equal(manual().props["aria-invalid"], true); assert.equal(h.button("Применить").props.disabled, true);
+    manual().props.onChange({ target: { value: "model:version-2026" } }); h.render();
+    let prevented = false;
+    manual().props.onKeyDown({ key: "Enter", nativeEvent: { isComposing: false }, preventDefault() { prevented = true; } });
+    h.render(); assert.equal(prevented, true, "Enter must not also activate the model badge after focus is restored");
+    assert.equal(commands.at(-1).value, "model:version-2026");
+    confirmApiSetting(h);
+  }
+});
+
+test("a scoped settings error ends loading and leaves the chat and its draft available", t => {
+  const h = setup(t), error = "Адрес профиля изменился";
+  h.event({ ...primary, recordId: "error-record", ...pinned });
+  h.draft("Keep this draft"); h.click("saved-model");
+  const request = commands.at(-1);
+  h.deliver({ ...request, type: "apiModelOptions", current: "", values: [], error });
+  assert.equal(textOf(h.find(node => node.props.role === "alert")), error);
+  assert.equal(h.button("Применить"), undefined);
+  assert.equal(h.find(node => node.props["aria-label"] === "ID модели API"), undefined);
+  h.click("Закрыть"); assert.equal(h.composer().props.value, "Keep this draft");
+});
+
+test("failed API saves preserve the setting and draft and allow retry or cancel", t => {
+  const h = setup(t);
+  h.event({ ...primary, recordId: "api-save-failure", ...pinned }); h.draft("My draft");
+  h.click("saved-model"); h.deliver({ ...commands.at(-1), type: "apiModelOptions", current: "", values: [] });
+  const input = () => h.find(node => node.props["aria-label"] === "ID модели API");
+  input().props.onChange({ target: { value: "model/v2" } }); h.render(); h.click("Применить");
+  const first = commands.at(-1);
+  assert.ok(input().props.disabled); assert.ok(h.button("Отмена").props.disabled);
+  const dialog = h.find(node => node.type === "dialog");
+  dialog.props.onCancel({ preventDefault() {} }); h.render();
+  assert.ok(h.find(node => node.type === "dialog"));
+  const fail = { ...first, type: "apiModelSettingSaved", ok: false, error: "Диск недоступен" };
+  h.deliver(fail);
+  assert.equal(textOf(h.find(node => node.props.role === "alert")), fail.error);
+  assert.equal(input().props.value, "model/v2");
+  assert.ok(!input().props.disabled);
+  h.click("Применить");
+  const retry = commands.at(-1); assert.notEqual(first.requestId, retry.requestId);
+  confirmApiSetting(h, first); assert.ok(h.button("Применить").props.disabled);
+  h.deliver({ ...fail, requestId: retry.requestId });
+  h.click("Отмена"); assert.equal(h.composer().props.value, "My draft");
+  assert.ok(!h.button("Отправить").props.disabled);
+});
+
+test("a missing save confirmation times out, keeps the selection, and ignores late acknowledgements", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = setup(t);
+  h.event({ ...primary, recordId: "api-lost-save", ...pinned }); h.draft("Unsent");
+  h.click("saved-model"); h.deliver({ ...commands.at(-1), type: "apiModelOptions", current: "custom", values: [] });
+  h.click("Применить"); const lost = commands.at(-1);
+  t.mock.timers.tick(20_000); h.render();
+  assert.match(textOf(h.find(node => node.props.role === "alert")), /Подтверждение сохранения не получено/);
+  assert.equal(h.find(node => node.props["aria-label"] === "ID модели API").props.value, "custom");
+  confirmApiSetting(h, lost); assert.ok(h.button("Применить"));
+  h.click("Применить"); confirmApiSetting(h);
+  assert.equal(h.find(node => node.type === "dialog"), undefined);
+  assert.equal(h.composer().props.value, "Unsent");
+});
 const rejected = message => ({ type: "sendRejected", requestId: message.requestId, recordId: message.recordId,
   path: message.path, ...(message.chatId && { chatId: message.chatId }), error: "Missing API key" });
 const echoes = message => ({ type: "userMessage", requestId: message.requestId, recordId: message.recordId,

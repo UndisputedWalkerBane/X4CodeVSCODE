@@ -29,6 +29,8 @@ import type { ProjectAccessProtocol, ProjectAccessSummary } from "./shared/proje
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { ApiProviderProfileStore, type ApiProviderProfile } from "./apiProviderProfiles";
+import { ABLITERATION_MODELS, apiEffortLevels, isValidApiModelId } from "./apiModelParameters";
+import { fetchApiModelIds } from "./apiProviderModels";
 import { manageApiProviderSettings } from "./apiProviderSettings";
 import { CompactModeController } from "./compactMode";
 import { agentEffortLevels, normalizeAgentChoice, normalizeAgentDefaults, resolveAgentChoice, type AgentChoice, type AgentDefaultEvent } from "./shared/agentDefaults";
@@ -192,6 +194,8 @@ interface SessionRecord {
   preferredAgent?: AgentId;
   /** Immutable destination for this conversation. Keys are resolved at run time. */
   apiProfile?: ApiProviderProfile;
+  apiModelOverride?: string;
+  apiEffortOverride?: string;
   /** A switch back to native also starts without automatic project journal context. */
   skipProjectJournal?: boolean;
   effortOverrides?: Partial<Record<AgentId, string>>;
@@ -2652,7 +2656,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const selected = (await this.providerProfiles().catalog()).find(entry => entry.id === id);
     if (!selected) throw new ApiProfileBindingError("Профиль API больше недоступен. Выберите другого провайдера.");
     // Persist only public metadata, even if the store supplies additional credential fields.
-    return { id: selected.id, name: selected.name, baseUrl: selected.baseUrl, model: selected.model };
+    return { id: selected.id, name: selected.name, baseUrl: selected.baseUrl, model: selected.model, ...(selected.effort ? { effort: selected.effort } : {}) };
   }
 
   private async postApiProviders() {
@@ -2674,7 +2678,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private profileInfo(record?: SessionRecord | null) {
-    return record?.apiProfile ? { apiProfileId: record.apiProfile.id, apiProfileName: record.apiProfile.name, apiProfileModel: record.apiProfile.model } : {};
+    return record?.apiProfile ? { apiProfileId: record.apiProfile.id, apiProfileName: record.apiProfile.name,
+      apiProfileModel: this.selectedModel(record, "codex"), apiProfileEffort: this.selectedEffort(record, "codex") } : {};
   }
 
   private chatDescriptor(slot: ChatSlot) {
@@ -2874,14 +2879,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const record = this.createRecord();
         const previous = this.getProjectStore(slot.projectPath).sessions.find((entry) => entry.id === slot.recordId);
         this.applyAgentChoice(record, this.recordAgentChoice(previous, slot.agent));
-        if (previous?.apiProfile) record.apiProfile = { ...previous.apiProfile };
+        if (previous?.apiProfile) {
+          const profile = await this.apiProfileMetadata(previous.apiProfile.id);
+          this.checkApiEndpoint(previous.apiProfile, profile);
+          record.apiProfile = profile;
+        }
         await this.mutateProjectStore(projectPath, store => { store.sessions.push(record); });
         await this.saveChatSlots(this.getChatSlots().map((entry) => entry.chatId === chatId
           ? { ...entry, projectPath, recordId: record.id } : entry));
       }
       await this.postMultiState(chatId);
-    } catch {
-      reject("Не удалось сохранить выбор проекта. Повторите переключение.");
+    } catch (error) {
+      reject(error instanceof ApiProfileBindingError ? error.message : "Не удалось сохранить выбор проекта. Повторите переключение.");
       await this.postMultiState(chatId);
     }
   }
@@ -2922,7 +2931,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!previous.apiProfile && !profile) {
         if (agent !== this.recordAgentChoice(previous, slot?.agent).agent) throw new Error("Чат уже использует встроенного провайдера. Повторите выбор.");
       } else if (!profile || !previous.apiProfile || profile.id !== previous.apiProfile.id || profile.baseUrl !== previous.apiProfile.baseUrl ||
-                 profile.model !== previous.apiProfile.model || profile.name !== previous.apiProfile.name) {
+                 profile.model !== previous.apiProfile.model || profile.effort !== previous.apiProfile.effort || profile.name !== previous.apiProfile.name) {
         const fresh = this.createRecord();
         fresh.preferredAgent = agent;
         if (profile) fresh.apiProfile = profile;
@@ -3179,7 +3188,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private selectedEffort(record: SessionRecord | null | undefined, agent: AgentId): string {
-    if (record?.apiProfile && agent === "codex") return "";
+    if (record?.apiProfile && agent === "codex") {
+      const levels = apiEffortLevels(record.apiProfile.id, this.selectedModel(record, agent));
+      return [record.apiEffortOverride, record.apiProfile.effort].find(effort => effort && levels.includes(effort)) ?? "";
+    }
     return this.effectiveEffort(agent, this.selectedModel(record, agent), record?.effortOverrides?.[agent]);
   }
 
@@ -3190,16 +3202,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private selectedModel(record: SessionRecord | null | undefined, agent: AgentId): string {
-    if (record?.apiProfile && agent === "codex") return record.apiProfile.model;
+    if (record?.apiProfile && agent === "codex") return isValidApiModelId(record.apiModelOverride) ? record.apiModelOverride : record.apiProfile.model;
     return record?.modelOverrides?.[agent] || vscode.workspace.getConfiguration(`agentHub.${agent}`).get<string>("model", "") || "";
   }
 
   private postRecordModel(projectPath: string, record: SessionRecord | null | undefined, agent: AgentId, chatId?: string) {
-    const fallbackFrom = record?.modelFallbacks?.[agent];
+    const fallbackFrom = record?.apiProfile && agent === "codex" ? undefined : record?.modelFallbacks?.[agent];
     const model = fallbackFrom && record?.models?.[agent]
       ? record.models[agent]!
       : this.selectedModel(record, agent) || record?.models?.[agent] || (agent === "codex" ? codexDefaultModel() ?? "" : "");
-    this.postScoped(projectPath, { type: "modelInfo", agent, model, ...(fallbackFrom ? { fallbackFrom } : {}) }, chatId);
+    this.postScoped(projectPath, { type: "modelInfo", agent, model, ...(record ? { recordId: record.id } : {}), ...(fallbackFrom ? { fallbackFrom } : {}) }, chatId);
   }
 
   private postMultiModels() {
@@ -3393,8 +3405,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return { ...record, items, sentMessages: messages };
   }
 
-  /** Only the surface's current durable binding may be edited or receive an attachment. */
-  private messageEditBinding(path: string | undefined, chatId: string | undefined, source: "vscode" | "remote", surface?: string) {
+  /** Resolve the exact saved conversation currently displayed by the requesting surface. */
+  private surfaceRecordBinding(path: string | undefined, chatId: string | undefined, source: "vscode" | "remote", surface?: string) {
     const board = source === "vscode" && surface === "multi-panel";
     if ((board && !chatId) || (!board && chatId)) return undefined;
     const slot = this.findChatSlot(chatId);
@@ -3409,7 +3421,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private messageEditTarget(msg: Extract<WebviewToHost, { type: "prepareMessageEdit" | "editMessage" }>, source: "vscode" | "remote", surface?: string) {
     if (typeof msg.requestId !== "string" || !msg.requestId || msg.requestId.length > 160 ||
         typeof msg.recordId !== "string" || !msg.recordId || typeof msg.messageId !== "string" || !msg.messageId) throw new Error("Некорректный запрос редактирования.");
-    const binding = this.messageEditBinding(msg.path, msg.chatId, source, surface);
+    const binding = this.surfaceRecordBinding(msg.path, msg.chatId, source, surface);
     if (!binding || binding.record.id !== msg.recordId) throw new Error("Чат или сессия изменились. Откройте сообщение заново.");
     const canonical = this.canonicalMessageRecord(binding.record, binding.key);
     const message = canonical.sentMessages?.[msg.messageId];
@@ -3538,7 +3550,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const branch = this.createRecord(prefix);
         branch.agentIds[message.agent] = prepared.resumeSessionId ?? null;
         branch.preferredAgent = message.agent;
-        if (current.record.apiProfile) branch.apiProfile = { ...current.record.apiProfile };
+        if (current.record.apiProfile) {
+          branch.apiProfile = { ...current.record.apiProfile };
+          if (current.record.apiModelOverride) branch.apiModelOverride = current.record.apiModelOverride;
+          if (current.record.apiEffortOverride) branch.apiEffortOverride = current.record.apiEffortOverride;
+        }
         if (current.record.skipProjectJournal) branch.skipProjectJournal = true;
         branch.chatLog = structuredClone((current.canonical.chatLog ?? []).slice(0, logCut));
         const sourceSessionId = current.record.agentIds[message.agent];
@@ -3750,13 +3766,122 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const binding = record.apiProfile;
     if (!binding) return this.buildAgentConfig(agent, record.modelOverrides?.[agent], record.effortOverrides?.[agent]);
     if (agent !== "codex") throw new Error("Эта сессия привязана к API-провайдеру. Обновите выбор провайдера.");
-    const profile = await this.providerProfiles().resolve(binding.id);
-    if (profile.id !== binding.id || profile.baseUrl !== binding.baseUrl) {
-      throw new Error("Адрес API-провайдера изменился. Выберите провайдера заново для новой сессии.");
-    }
+    const profile = await this.resolvePinnedProfile(binding);
     const cfg = vscode.workspace.getConfiguration("agentHub.codex");
-    return { model: binding.model, contextWindow: 0, sandbox: cfg.get<string>("sandbox") || "workspace-write", yolo: cfg.get<boolean>("yolo") || false,
+    return { model: this.selectedModel(record, agent), effort: this.selectedEffort(record, agent) || undefined,
+      contextWindow: 0, sandbox: cfg.get<string>("sandbox") || "workspace-write", yolo: cfg.get<boolean>("yolo") || false,
       apiProvider: { id: profile.id, name: binding.name, baseUrl: binding.baseUrl, ...(profile.apiKey ? { apiKey: profile.apiKey } : {}) } };
+  }
+
+  private async resolvePinnedProfile(binding: ApiProviderProfile) {
+    const profile = await this.providerProfiles().resolve(binding.id);
+    this.checkApiEndpoint(binding, profile);
+    return profile;
+  }
+
+  private checkApiEndpoint(binding: ApiProviderProfile, current: ApiProviderProfile) {
+    if (current.id !== binding.id || current.baseUrl !== binding.baseUrl) {
+      throw new ApiProfileBindingError("Адрес API-провайдера изменился. Выберите провайдера заново для новой сессии.");
+    }
+  }
+
+  private async handleApiModelSetting(
+    msg: Extract<WebviewToHost, { type: "apiModelSettings" | "applyApiModelSetting" }>,
+    source: "vscode" | "remote", client?: RemoteClient, surface?: string,
+  ) {
+    const { path, chatId, recordId, apiProfileId, action } = msg;
+    if (typeof path !== "string" || !path || typeof recordId !== "string" || !recordId ||
+      typeof apiProfileId !== "string" || !apiProfileId || (action !== "model" && action !== "effort") ||
+      (chatId !== undefined && (typeof chatId !== "string" || !chatId))) return;
+    if ((surface === "multi-panel" && source === "vscode") !== (chatId !== undefined)) return;
+    const requestId = typeof msg.requestId === "string" && msg.requestId.length > 0 && msg.requestId.length <= 160 ? msg.requestId : undefined;
+    const address = { path, recordId, apiProfileId, action, ...(chatId ? { chatId } : {}), ...(requestId ? { requestId } : {}) };
+    const reply = (event: HostToWebview) => {
+      if (source === "remote") client?.send(event);
+      else {
+        const target = surface === "multi-panel" ? this.multiPanel : surface === "panel" ? this.panel : this.view;
+        target?.webview.postMessage(event);
+      }
+    };
+    const currentRecord = () => {
+      const record = this.surfaceRecordBinding(path, chatId, source, surface)?.record;
+      return record?.id === recordId && record.apiProfile?.id === apiProfileId ? record : undefined;
+    };
+    const idleRecord = () => {
+      const record = currentRecord();
+      if (!record?.apiProfile) throw new ApiProfileBindingError("Чат изменился. Откройте параметры API заново.");
+      if (this.runs.has(chatId ?? path) || this.messageEditPreparations?.has(chatId ?? path) ||
+        this.sessionWriters?.has(`record:${path}:${recordId}:codex`) || this.sessionWriters?.has(`edit-record:${path}:${recordId}`)) {
+        throw new ApiProfileBindingError("Дождитесь завершения хода или редактирования перед изменением параметров API.");
+      }
+      return record;
+    };
+    try {
+      // Read after preceding local edits; discovery itself never holds the board's mutation queue.
+      if (msg.type === "apiModelSettings") await this.multiMutation;
+      const binding = idleRecord().apiProfile!;
+      this.checkApiEndpoint(binding, await this.apiProfileMetadata(apiProfileId));
+      const record = idleRecord();
+      if (msg.type === "apiModelSettings") {
+        let values: readonly string[];
+        let notice: string | undefined;
+        if (action === "effort") {
+          values = apiEffortLevels(apiProfileId, this.selectedModel(record, "codex"));
+        } else {
+          try {
+            const profile = await this.resolvePinnedProfile(binding);
+            idleRecord();
+            values = await fetchApiModelIds(profile);
+            if (!values.length) notice = "Провайдер вернул пустой каталог. Можно ввести идентификатор модели вручную.";
+          } catch (error) {
+            if (error instanceof ApiProfileBindingError) throw error;
+            values = apiProfileId === "abliteration" ? ABLITERATION_MODELS : [];
+            notice = values.length ? "Не удалось загрузить каталог. Показаны модели из документации провайдера." :
+              "Не удалось загрузить каталог. Можно ввести идентификатор модели вручную.";
+          }
+        }
+        const latest = idleRecord();
+        const current = (action === "model" ? latest.apiModelOverride : latest.apiEffortOverride) ?? "";
+        reply({ type: "apiModelOptions", ...address, values: ["", ...values], current, notice });
+        return;
+      }
+      await this.mutateRecord(path, recordId, entry => {
+        idleRecord();
+        const { value } = msg;
+        if (action === "model") {
+          if (value !== "" && !isValidApiModelId(value)) throw new ApiProfileBindingError("Укажите корректный идентификатор модели API.");
+          if (value) entry.apiModelOverride = value; else delete entry.apiModelOverride;
+          if (entry.apiEffortOverride && !apiEffortLevels(apiProfileId, this.selectedModel(entry, "codex")).includes(entry.apiEffortOverride)) {
+            delete entry.apiEffortOverride;
+          }
+        } else {
+          if (value !== "" && !apiEffortLevels(apiProfileId, this.selectedModel(entry, "codex")).includes(value)) {
+            throw new ApiProfileBindingError("Этот уровень размышлений недоступен для выбранной модели API.");
+          }
+          if (value) entry.apiEffortOverride = value; else delete entry.apiEffortOverride;
+        }
+      });
+      const updated = currentRecord();
+      if (updated) this.postApiModelSettings(path, updated);
+      if (requestId) reply({ type: "apiModelSettingSaved", ...address, requestId, ok: true });
+    } catch (error) {
+      const message = error instanceof ApiProfileBindingError ? error.message : "Не удалось открыть или сохранить параметры этой API-сессии. Повторите действие.";
+      if (msg.type === "apiModelSettings") reply({ type: "apiModelOptions", ...address, values: [], current: "", error: message });
+      else if (requestId) reply({ type: "apiModelSettingSaved", ...address, requestId, ok: false, error: message });
+      else if (currentRecord()) reply({ type: "error", path, ...(chatId ? { chatId } : {}), message });
+    }
+  }
+
+  private postApiModelSettings(path: string, record: SessionRecord) {
+    const publish = (chatId?: string) => {
+      this.postRecordAgent(path, record, chatId);
+      this.postRecordModel(path, record, "codex", chatId);
+      this.postScoped(path, { type: "effortInfo", agent: "codex", effort: this.selectedEffort(record, "codex"), recordId: record.id }, chatId);
+    };
+    if (this.getActiveProjectKey() === path && this.getActiveRecord(path)?.id === record.id) publish();
+    const slots = this.getChatSlots().filter(slot => slot.projectPath === path && slot.recordId === record.id);
+    if (slots.length) this.postMultiBoardState();
+    for (const slot of slots) publish(slot.chatId);
   }
 
   /** Настройки агента (модель, effort и т.п.) из VS Code settings. */
@@ -4855,7 +4980,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     serialized = false,
   ): Promise<void> {
     if (!serialized && (
-      ["selectAgent", "selectApiProvider", "selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript", "saveTaskState"].includes(msg.type) ||
+      ["selectAgent", "selectApiProvider", "applyApiModelSetting", "selectProject", "moveProject", "reorderProjects", "openMultiChat", "createChat", "removeChat", "selectChatProject", "selectChatSession", "selectChatAgent", "newSession", "saveTranscript", "saveTaskState"].includes(msg.type) ||
       msg.type === "ready" || (surface === "multi-panel" && msg.type === "multiStateReady")
     )) {
       return this.serializeMultiMutation(() => this.onMessage(msg, source, client, surface, true));
@@ -4905,6 +5030,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case "selectApiProvider":
         await this.selectApiProvider(msg, surface);
+        break;
+      case "apiModelSettings":
+      case "applyApiModelSetting":
+        await this.handleApiModelSetting(msg, source, client, surface);
         break;
       case "ready":
         await this.postApiProviders();
@@ -6080,7 +6209,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               r.models = { ...r.models, [agent]: ev.model };
               r.modelFallbacks = { ...r.modelFallbacks, [agent]: ev.fallbackFrom ?? undefined };
             });
-            emit({ type: "modelInfo", agent, model: ev.model, fallbackFrom: ev.fallbackFrom });
+            emit({ type: "modelInfo", agent, recordId: record.id, model: ev.model, fallbackFrom: ev.fallbackFrom });
             break;
           case "textDelta":
             delivered = true;

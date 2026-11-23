@@ -189,6 +189,15 @@ body {
   cursor: default;
 }
 
+.api-statusbar {
+  flex-wrap: wrap;
+  row-gap: 3px;
+}
+
+.api-statusbar .model-badge {
+  max-width: 100%;
+}
+
 .model-badge.model-fallback {
   color: var(--vscode-charts-yellow, #d29922);
   font-weight: 600;
@@ -1093,6 +1102,27 @@ body.resizing-composer {
   min-height: 120px;
   max-height: 55vh;
   resize: vertical;
+}
+
+.api-model-dialog {
+  width: min(26rem, calc(100% - 24px));
+  overflow-wrap: anywhere;
+}
+
+.api-model-dialog select {
+  width: 100%;
+  min-width: 0;
+  padding: 7px;
+  font: inherit;
+  color: var(--vscode-dropdown-foreground);
+  background: var(--vscode-dropdown-background);
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+}
+
+@media (pointer: coarse) {
+  .api-model-dialog :is(input, select, button) {
+    min-height: 44px;
+  }
 }
 
 .text-attachment-actions {

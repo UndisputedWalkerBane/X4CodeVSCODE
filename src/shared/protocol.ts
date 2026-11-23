@@ -21,6 +21,15 @@ export interface ApiProviderBinding {
   apiProfileId?: string;
   apiProfileName?: string;
   apiProfileModel?: string;
+  apiProfileEffort?: string;
+}
+
+export interface ApiModelSettingsTarget {
+  path: string;
+  recordId: string;
+  apiProfileId: string;
+  chatId?: string;
+  action: "model" | "effort";
 }
 
 export interface MultiChatDescriptor extends ApiProviderBinding {
@@ -107,6 +116,8 @@ export type WebviewToHost =
   | { type: "selectChatAgent"; chatId: string; agent: AgentId }
   | { type: "selectAgent"; agent: AgentId; path?: string }
   | { type: "selectApiProvider"; profileId: string | null; agent: AgentId; path: string; recordId: string; chatId?: string }
+  | ({ type: "apiModelSettings"; requestId?: string } & ApiModelSettingsTarget)
+  | ({ type: "applyApiModelSetting"; requestId: string; value: string } & ApiModelSettingsTarget)
   | { type: "manageApiProviders" }
   | { type: "duplicateProject"; path: string; copyFolder: boolean }
   | { type: "archiveProject"; path: string }
@@ -275,8 +286,10 @@ export type HostToWebview =
   | { type: "compactMode"; enabled: boolean; pending?: boolean; error?: string }
   | ({ type: "agentInfo"; agent: AgentId; path?: string; chatId?: string; recordId?: string; requestedAgent?: AgentId; requestedApiProfileId?: string | null; contextRequestId?: string; error?: string } & ApiProviderBinding)
   | { type: "apiProviders"; profiles: ApiProviderOption[] }
+  | ({ type: "apiModelOptions"; requestId?: string; values: string[]; current: string; notice?: string; error?: string } & ApiModelSettingsTarget)
+  | ({ type: "apiModelSettingSaved"; requestId: string; ok: boolean; error?: string } & ApiModelSettingsTarget)
   | { type: "contextUsage"; agent: AgentId; used: number; max: number; path?: string; chatId?: string }
-  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string }
+  | { type: "modelInfo"; agent: AgentId; model: string; fallbackFrom?: string; path?: string; chatId?: string; recordId?: string }
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot; chatId?: string }
   | { type: "projectAccesses"; projectPath: string; requestId: string; revision: number; entries: ProjectAccessSummary[]; error?: string; chatId?: string }

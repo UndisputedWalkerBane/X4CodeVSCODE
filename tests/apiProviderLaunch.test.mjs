@@ -55,7 +55,7 @@ test("installed Codex routes HTTP Responses turns and tool output to the selecte
     OPENAI_API_KEY:"fake-native-key", [envKey]:"stale-key-from-another-run" };
   t.after(() => { process.env = inherited; });
   await writeFile(join(codexHome,"auth.json"), JSON.stringify({OPENAI_API_KEY:"fake-saved-account-key", auth_mode:"apikey"}));
-  await writeFile(join(codexHome,"config.toml"), '[shell_environment_policy]\ninherit = "all"\nignore_default_excludes = true\n');
+  await writeFile(join(codexHome,"config.toml"), 'model_reasoning_effort = "medium"\n[shell_environment_policy]\ninherit = "all"\nignore_default_excludes = true\n');
   const requests = [];
   let sequence = 0;
   const server = createServer(async (req, res) => {
@@ -95,9 +95,9 @@ test("installed Codex routes HTTP Responses turns and tool output to the selecte
   const base = `http://127.0.0.1:${server.address().port}`;
   const runConfig = (name, key) => ({ ...config, sandbox: "read-only",
     apiProvider: { ...config.apiProvider, baseUrl: `${base}/${name}/v1`, apiKey: key } });
-  const run = async (backend, name, key, resumeSessionId) => {
+  const run = async (backend, name, key, resumeSessionId, parameters) => {
     const events = [];
-    for await (const event of backend.start("Reply with a fixture greeting.", {cwd, config:runConfig(name, key), resumeSessionId,
+    for await (const event of backend.start("Reply with a fixture greeting.", {cwd, config:{ ...runConfig(name, key), ...parameters }, resumeSessionId,
       messageId:"fixture-prompt", signal:AbortSignal.timeout(20_000), confirmTool:async () => ({allow:true})})) events.push(event);
     return events;
   };
@@ -128,6 +128,19 @@ test("installed Codex routes HTTP Responses turns and tool output to the selecte
   const anon = requests.filter(r => r.route === "/anonymous/v1/responses");
   assert.equal(anon.length, 1);
   assert.equal(anon[0].auth, undefined);
+  for (const backend of [app, exec]) {
+    const thread = await collect(backend, "parameters", credential, undefined, { model: "abliterated-model", effort: "high" });
+    assert.equal(requests.at(-1).payload.model, "abliterated-model");
+    assert.equal(requests.at(-1).payload.reasoning?.effort, "high");
+    await collect(backend, "parameters", credential, thread.sessionId, { model: "abliterated-model-large-v2", effort: "max" });
+    assert.equal(requests.at(-1).payload.model, "abliterated-model-large-v2");
+    assert.equal(requests.at(-1).payload.reasoning?.effort, "max");
+    await collect(backend, "parameters", credential, thread.sessionId, { model: "abliterated-model-large-v2" });
+    // Resetting the chat override restores this isolated CLI home's configured default.
+    assert.equal(requests.at(-1).payload.reasoning?.effort, "medium");
+    await collect(backend, "parameters", credential, thread.sessionId, { model: "abliterated-model", effort: "none" });
+    assert.equal(requests.at(-1).payload.reasoning?.effort, "none");
+  }
   for (const backend of [exec, app]) {
     const rejected = await run(backend, "reject", credential);
     assert.ok(rejected.some(e => e.kind === "error" && e.message.includes("Invalid profile credential")), JSON.stringify(rejected));

@@ -16,11 +16,12 @@ await build({
   entryPoints: [fileURLToPath(new URL("../src/ChatViewProvider.ts", import.meta.url))],
   outfile, bundle: true, platform: "node", format: "esm",
   plugins: [{ name: "isolated-agent-defaults", setup(b) {
-    b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/remoteServer$|^\.\/journal$/ }, ({ path }) => ({ path, namespace: "stub" }));
+    b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/(remoteServer|journal|apiProviderModels)$/ }, ({ path }) => ({ path, namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => {
       const h = 'globalThis[Symbol.for("agent-hub-defaults-host-tests")].current';
       if (path === "vscode") return { contents: `export const workspace={workspaceFolders:[],getConfiguration:(section)=>${h}.configuration(section)};export const window={createQuickPick:()=>${h}.quickPick,showQuickPick:async(items)=>{${h}.choices.push(items);return ${h}.pick;},showWarningMessage:async()=>${h}.warning,showInformationMessage:async()=>{},showErrorMessage:(message)=>${h}.errors.push(message)};export const Uri={},commands={executeCommand:async()=>{}},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={};export class ThemeIcon{};` };
       if (path === "node:child_process") return { contents: 'export const spawn=()=>{throw new Error("unexpected external process")};' };
+      if (path === "./apiProviderModels") return { contents: `export const fetchApiModelIds=profile=>${h}.discover(profile);` };
       if (path === "./journal") return { contents: 'export const readJournalContext=async()=>"";export const buildFinishPrompt=()=>"";' };
       if (path === "./remoteServer") return { contents: 'export class RemoteServer{};export const enableTailscaleFunnel=()=>{};export const generateToken=()=>"";export const lanAddresses=()=>[];export const tailscaleInfo=()=>{};' };
       if (path === "qrcode") return { contents: 'export const toString=()=>"";export default {};' };
@@ -584,4 +585,190 @@ test("a stale Finish button cannot start a turn or reset the replacement chat", 
     { recordId: record.id, path: h.projects[1].id, apiProfileId: profile.id },
   ]) await h.send({ type: "finishSession", agent: "codex", ...stale }, "view");
   assert.equal(h.active().agentIds.codex, "external-thread");
+});
+
+async function apiChat(h, tiled = false, metadata = {}) {
+  const profile = { id: "custom", name: "Gateway", model: "profile-model", effort: "medium", baseUrl: "https://example.test/v1", ...metadata };
+  const path = h.projects[0].id;
+  const chatId = tiled ? "chat-api-settings" : undefined;
+  const surface = tiled ? "multi-panel" : "view";
+  h.p.view = { webview: { postMessage: message => h.messages.push(message) } };
+  h.p.apiProfileStore = { catalog: async () => [profile], resolve: async () => ({ ...profile, apiKey: "fixture-secret" }) };
+  if (tiled) await h.p.saveChatSlots([{ chatId, projectPath: path, recordId: h.active().id, agent: "claude" }]);
+  await h.send({ type: "selectApiProvider", path, chatId, agent: "codex", recordId: h.active().id, profileId: profile.id }, surface);
+  const record = () => tiled ? h.slotRecord(h.p.findChatSlot(chatId)) : h.active();
+  const origin = { path, apiProfileId: profile.id, recordId: record().id, ...(chatId ? { chatId } : {}) };
+  const apply = (action, value) => h.send({ type: "applyApiModelSetting", ...origin, action, value }, surface);
+  return { profile, origin, record, surface, apply };
+}
+
+test("API model and effort choices follow only the selected record into the runner, headers and restored session", async () => {
+  for (const tiled of [false, true]) {
+    const h = setup(), { profile, origin, record, apply, surface } = await apiChat(h, tiled);
+    const nativeDefaults = clone(h.values);
+    const nativeLastChoice = h.workspace.get("agentHub.lastAgentChoice");
+    assert.equal((await h.p.configForRecord("codex", record())).effort, "medium");
+    h.discover = async resolved => {
+      assert.equal(resolved.baseUrl, profile.baseUrl);
+      assert.equal(resolved.apiKey, "fixture-secret");
+      return ["live-model"];
+    };
+    await h.send({ type: "apiModelSettings", ...origin, action: "model", requestId: "menu-1" }, surface);
+    const menu = h.messages.findLast(message => message.type === "apiModelOptions");
+    assert.deepEqual(menu.values, ["", "live-model"]); assert.equal(menu.current, ""); assert.equal(menu.requestId, "menu-1");
+    assert.equal(menu.recordId, origin.recordId); assert.equal(menu.chatId, origin.chatId);
+    await apply("model", "custom/manual-model"); await apply("effort", "low");
+    const config = await h.p.configForRecord("codex", record());
+    assert.equal(config.model, "custom/manual-model"); assert.equal(config.effort, "low");
+    assert.deepEqual(h.values, nativeDefaults); assert.equal(h.workspace.get("agentHub.lastAgentChoice"), nativeLastChoice);
+    assert.equal(record().apiProfile.model, "profile-model");
+    if (tiled) assert.equal(h.active().apiProfile, undefined);
+    profile.effort = "high"; profile.model = "changed-profile-model";
+    assert.ok(!JSON.stringify(h.messages).includes("fixture-secret"));
+    const restored = setup({ global: h.global, workspace: h.workspace });
+    restored.p.apiProfileStore = h.p.apiProfileStore;
+    await restored.send({ type: "ready", chatId: origin.chatId }, surface);
+    const header = restored.messages.findLast(m => m.type === "agentInfo" && m.recordId === origin.recordId);
+    assert.equal(header.apiProfileModel, config.model); assert.equal(header.apiProfileEffort, config.effort);
+    const model = restored.messages.findLast(m => m.type === "modelInfo" && m.agent === "codex" && m.chatId === origin.chatId);
+    const effort = restored.messages.findLast(m => m.type === "effortInfo" && m.agent === "codex" && m.chatId === origin.chatId);
+    assert.equal(model.model, config.model); assert.equal(effort.effort, config.effort);
+    for (const action of ["model", "effort"]) await restored.send({ type: "applyApiModelSetting", ...origin, action, value: "" }, surface);
+    const saved = tiled ? restored.slotRecord(restored.p.findChatSlot(origin.chatId)) : restored.active();
+    const defaults = await restored.p.configForRecord("codex", saved);
+    assert.equal(defaults.model, "profile-model"); assert.equal(defaults.effort, "medium");
+  }
+});
+
+test("API setting changes reject stale origins, cross-surface messages, invalid values and busy records", async () => {
+  const h = setup(), { origin, record, apply } = await apiChat(h, true);
+  const original = clone(record());
+  const change = { type: "applyApiModelSetting", ...origin, action: "model", value: "changed" };
+  for (const stale of [{ path: "" }, { path: h.projects[1].id }, { recordId: "old" }, { apiProfileId: "other" }, { chatId: "old" }]) await h.send({ ...change, ...stale });
+  await h.send(change, "view");
+  await h.p.onMessage(change, "remote", { send() {} });
+  await apply("effort", "invented"); await apply("model", "line\nbreak");
+  h.p.runs.set(origin.chatId, new AbortController()); await h.send(change); h.p.runs.clear();
+  h.p.sessionWriters = new Map([[`record:${origin.path}:${origin.recordId}:codex`, new AbortController()]]);
+  await h.send(change); h.p.sessionWriters.clear();
+  assert.deepEqual(record(), original);
+});
+
+test("remote model discovery answers only its requester and discards delayed replies after a rebind", async () => {
+  const h = setup(), { origin } = await apiChat(h);
+  const replies = [], client = { send: message => replies.push(message) };
+  const request = { type: "apiModelSettings", ...origin, action: "model", requestId: "remote-menu" };
+  h.discover = async () => { throw new Error("remote server error fixture-secret"); };
+  await h.p.onMessage(request, "remote", client);
+  const fallback = replies.findLast(m => m.type === "apiModelOptions");
+  assert.deepEqual(fallback.values, [""]); assert.ok(fallback.notice); assert.equal(fallback.requestId, "remote-menu");
+  assert.ok(!JSON.stringify(replies).includes("fixture-secret"));
+  assert.ok(!h.messages.some(m => m.type === "apiModelOptions"));
+  let start, finish;
+  const started = new Promise(resolve => { start = resolve; });
+  h.discover = () => new Promise(resolve => { finish = resolve; start(); });
+  const pending = h.p.onMessage(request, "remote", client);
+  await started;
+  await h.send({ type: "newSession" }, "view");
+  finish(["late-model"]); await pending;
+  const stale = replies.at(-1);
+  assert.equal(stale.type, "apiModelOptions"); assert.equal(stale.requestId, "remote-menu");
+  assert.deepEqual(stale.values, []); assert.match(stale.error, /изменился/);
+  const current = h.active();
+  await h.p.onMessage({ type: "applyApiModelSetting", ...origin, action: "model", value: "late-model" }, "remote", client);
+  assert.equal((await h.p.configForRecord("codex", current)).model, "profile-model");
+});
+
+test("a reassigned API endpoint never receives the saved conversation's model discovery request", async () => {
+  const h = setup(), { origin, profile } = await apiChat(h);
+  profile.baseUrl = "https://different.test/v1";
+  let discovered = 0;
+  h.discover = async () => { discovered++; return ["unexpected"]; };
+  await h.send({ type: "apiModelSettings", ...origin, action: "model", requestId: "blocked" }, "view");
+  assert.equal(discovered, 0);
+  const blocked = h.messages.findLast(m => m.type === "apiModelOptions");
+  assert.equal(blocked.requestId, "blocked"); assert.deepEqual(blocked.values, []); assert.match(blocked.error, /адрес/i);
+});
+
+test("changing API models removes an incompatible override and filters inherited effort", async () => {
+  const h = setup(), { origin, apply, record } = await apiChat(h, false, { id: "abliteration", model: "abliterated-model", effort: "medium" });
+  const request = { type: "apiModelSettings", ...origin, action: "model" };
+  h.discover = async () => { throw new Error("offline"); };
+  await h.send(request, "view");
+  const offline = h.messages.findLast(m => m.type === "apiModelOptions");
+  assert.ok(offline.values.includes("abliterated-model-large-flash")); assert.ok(offline.notice);
+  await apply("effort", "xhigh"); await apply("model", "abliterated-model-large-v2");
+  await h.send({ ...request, action: "effort" }, "view");
+  const levels = h.messages.findLast(m => m.type === "apiModelOptions");
+  assert.deepEqual(levels.values, ["", "low", "high", "max"]); assert.equal(levels.current, "");
+  assert.equal((await h.p.configForRecord("codex", record())).effort, undefined);
+  await apply("effort", "max");
+  assert.equal((await h.p.configForRecord("codex", record())).effort, "max");
+  await apply("model", "");
+  assert.equal((await h.p.configForRecord("codex", record())).effort, "medium");
+  h.discover = async () => ["available-now"];
+  await h.send(request, "view");
+  assert.deepEqual(h.messages.findLast(m => m.type === "apiModelOptions").values, ["", "available-now"]);
+});
+
+test("API model persistence failure leaves the committed settings available on reload", async () => {
+  const h = setup(), { origin, record, apply } = await apiChat(h);
+  await apply("model", "original"); await apply("effort", "high");
+  const change = { type: "applyApiModelSetting", ...origin, action: "model", value: "original", requestId: "from-picker" };
+  await h.send(change, "view");
+  assert.equal(h.messages.findLast(m => m.type === "apiModelSettingSaved" && m.requestId === change.requestId).ok, true);
+  const update = h.p.context.globalState.update;
+  let fail = true;
+  h.p.context.globalState.update = async (key, value) => {
+    await update(key, value);
+    if (key === STORE && fail) { fail = false; throw new Error("failed to persist"); }
+  };
+  await h.send({ ...change, value: "unsaved", requestId: "failed-save" }, "view");
+  assert.equal((await h.p.configForRecord("codex", record())).model, "original");
+  const restored = setup({ global: h.global, workspace: h.workspace });
+  restored.p.apiProfileStore = h.p.apiProfileStore;
+  const config = await restored.p.configForRecord("codex", restored.active());
+  assert.equal(config.model, "original"); assert.equal(config.effort, "high");
+  const result = h.messages.findLast(m => m.type === "apiModelSettingSaved" && m.requestId === "failed-save");
+  assert.equal(result.ok, false);
+  assert.match(result.error, /сохранить/);
+});
+
+test("API message edits prepare the fork and its next turn with the same scoped settings", async () => {
+  const h = setup(), { record, origin, apply } = await apiChat(h);
+  await apply("model", "session-model"); await apply("effort", "low");
+  const message = { messageId: "edit-me", agent: "codex", kind: "prompt", text: "original", attachmentFiles: [], logCut: 0,
+    anchor: { provider: "codex", sessionId: "native-origin", turnId: "old-turn" } };
+  Object.assign(record(), { agentIds: { codex: "native-origin", claude: null },
+    items: [{ role: "user", text: message.text, sentMessage: message }], sentMessages: { [message.messageId]: message },
+    chatLog: [{ role: "user", agent: "codex", text: message.text }] });
+  const configs = [];
+  h.p.sessionWriters = new Map();
+  h.p.backends = { codex: { async prepareEdit({ config }) { configs.push(config); return { resumeSessionId: "native-prefix" }; } } };
+  h.p.runTurn = async () => { configs.push(await h.p.configForRecord("codex", record())); return true; };
+  await h.send({ type: "editMessage", path: origin.path, recordId: origin.recordId, requestId: "fork-with-settings", messageId: message.messageId,
+    text: "replacement", attachments: [] }, "view");
+  assert.equal(h.messages.findLast(m => m.type === "editMessageResult").ok, true);
+  assert.notEqual(record().id, origin.recordId);
+  assert.deepEqual(configs.map(({ model, effort, apiProvider }) => [model, effort, apiProvider.id]),
+    [["session-model", "low", origin.apiProfileId], ["session-model", "low", origin.apiProfileId]]);
+});
+
+test("switching an API tile's project starts with current defaults on the same pinned endpoint", async () => {
+  const h = setup(), { profile, origin, record, apply, surface } = await apiChat(h, true);
+  await apply("model", "old-chat-override");
+  profile.model = "updated-default";
+  profile.effort = "low";
+  const oldUrl = profile.baseUrl;
+  profile.baseUrl = "https://replacement.invalid/v1";
+  const target = { type: "selectChatProject", chatId: origin.chatId, projectPath: h.projects[1].id };
+  await h.send(target, surface);
+  assert.equal(record().id, origin.recordId);
+  assert.match(h.messages.findLast(m => m.type === "chatProjectRejected").message, /адрес/i);
+  profile.baseUrl = oldUrl;
+  await h.send(target, surface);
+  assert.notEqual(record().id, origin.recordId);
+  const config = await h.p.configForRecord("codex", record());
+  assert.equal(config.model, "updated-default");
+  assert.equal(config.effort, "low");
 });

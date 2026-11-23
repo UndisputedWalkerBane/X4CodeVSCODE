@@ -11,6 +11,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
   AgentId,
+  ApiModelSettingsTarget,
   ApiProviderBinding,
   ApiProviderOption,
   Attachment,
@@ -25,6 +26,7 @@ import type {
 } from "../src/shared/protocol";
 
 import { projectKey } from "../src/shared/projectIdentity";
+import { isValidApiModelId } from "../src/apiModelParameters";
 import { AgentDefaultsSettings } from "./AgentDefaultsSettings";
 import { TaskCheckpoint, type TaskSnapshot } from "./TaskCheckpoint";
 import { ProjectAccesses, type ProjectAccessSnapshot, type ProjectAccessTestResult } from "./ProjectAccesses";
@@ -51,7 +53,8 @@ const IN_MULTI_PANEL =
 const CHAT_COMMAND_TYPES = new Set([
   "ready", "send", "steer", "saveTranscript", "permission", "newSession", "finishSession",
   "showSessions", "showContext", "pickModel", "pickEffort", "stop", "choose",
-  "selectChatProject", "selectChatSession", "selectChatAgent", "selectApiProvider", "pickAttachment", "saveAttachment",
+  "selectChatProject", "selectChatSession", "selectChatAgent", "selectApiProvider", "apiModelSettings", "applyApiModelSetting",
+  "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
   "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess", "testProjectAccess",
   "prepareMessageEdit", "editMessage",
@@ -61,7 +64,7 @@ const CHAT_EVENT_TYPES = new Set([
   "draftHandled", "choices", "attachmentAdded", "ask", "permissionResolved", "toolUse",
   "toolResult", "assistantText", "textDelta", "error", "info", "meta", "turnResult",
   "permissionRequest", "reset", "settings", "configJson", "openSettingsScreen", "chatProjectRejected",
-  "agentInfo", "effortInfo", "taskState",
+  "agentInfo", "effortInfo", "apiModelOptions", "apiModelSettingSaved", "taskState",
   "projectAccesses", "projectAccessTestResult",
   "messageEditPrepared", "editMessageResult", "sendRejected",
 ]);
@@ -71,6 +74,26 @@ interface ProviderSelection {
   /** Absent for native-to-native switches, null when leaving an API provider. */
   profileId?: string | null;
 }
+
+interface ApiModelPicker {
+  target: ApiModelSettingsTarget;
+  requestId: string;
+  values?: string[];
+  notice?: string;
+  error?: string;
+  saveRequestId?: string;
+  saveError?: string;
+  manual?: boolean;
+  value: string;
+}
+
+function sameApiSetting(target: ApiModelSettingsTarget, event: ApiModelSettingsTarget) {
+  return event.path === target.path && event.recordId === target.recordId &&
+    event.apiProfileId === target.apiProfileId && event.action === target.action;
+}
+
+// A model ID cannot contain whitespace.
+const MANUAL_API_MODEL = "enter model ID";
 
 interface SubmittedApiDraft {
   requestId: string;
@@ -292,6 +315,7 @@ function ChatTile({
   initialApiProfileId,
   initialApiProfileName,
   initialApiProfileModel,
+  initialApiProfileEffort,
 }: {
   chatId?: string;
   initialProjectPath?: string;
@@ -300,6 +324,7 @@ function ChatTile({
   initialApiProfileId?: string;
   initialApiProfileName?: string;
   initialApiProfileModel?: string;
+  initialApiProfileEffort?: string;
 } = {}) {
   const post = useCallback((msg: WebviewToHost) => {
     const scoped = chatId && CHAT_COMMAND_TYPES.has(msg.type)
@@ -347,7 +372,11 @@ function ChatTile({
   const [apiProviders, setApiProviders] = useState<ApiProviderOption[]>([]);
   const [apiBinding, setApiBinding] = useState<ApiProviderBinding>({
     apiProfileId: initialApiProfileId, apiProfileName: initialApiProfileName, apiProfileModel: initialApiProfileModel,
+    apiProfileEffort: initialApiProfileEffort,
   });
+  const [apiPicker, setApiPicker] = useState<ApiModelPicker | null>(null);
+  const apiDialogRef = useRef<HTMLDialogElement>(null);
+  const apiPickerTrigger = useRef<HTMLButtonElement | null>(null);
   const [agentReady, setAgentReady] = useState(initialAgent !== undefined);
   const [draft, setDraft] = useState("");
   // API credentials can fail before the host echoes a prompt. Keep the local
@@ -544,6 +573,8 @@ function ChatTile({
       restoreIntoEmptyComposer.current = undefined;
       setSendError("");
       setApiBinding({});
+      setApiPicker(null);
+      setChoice(null);
       normalAttachmentDraftRef.current = draftId();
       filePickerTargetRef.current = null;
       imageReplacementRef.current = null;
@@ -595,6 +626,9 @@ function ChatTile({
   const efforts = effortsBy[activePath] ?? {};
   const queue = queueBy[activePath] ?? [];
   const editBlocked = busy || agentSwitching || projectSwitching || !agentReady;
+  const apiSettingsDisabled = editBlocked || !bindingRef.current.recordId;
+  const apiDialogId = `api-model-settings-${chatId ?? "main"}`;
+  const invalidManualModel = !!(apiPicker?.manual && apiPicker.value.trim() && !isValidApiModelId(apiPicker.value.trim()));
   const editFormDisabled = !!messageEdit && messageEdit.phase !== "ready";
   const editErrorId = `message-edit-error-${chatId ?? "main"}`;
   const editHintId = `message-edit-hint-${chatId ?? "main"}`;
@@ -751,6 +785,20 @@ function ChatTile({
         case "apiProviders":
           setApiProviders(msg.profiles);
           break;
+        case "apiModelOptions":
+          setApiPicker(picker => {
+            if (!picker || picker.values || msg.requestId !== picker.requestId || !sameApiSetting(picker.target, msg)) return picker;
+            const values = msg.values.filter(Boolean);
+            const manual = msg.action === "model" && (!values.length || (!!msg.current && !values.includes(msg.current)));
+            return { ...picker, values, manual, notice: msg.notice, error: msg.error, value: msg.current };
+          });
+          break;
+        case "apiModelSettingSaved":
+          setApiPicker(picker => {
+            if (!picker?.saveRequestId || msg.requestId !== picker.saveRequestId || !sameApiSetting(picker.target, msg)) return picker;
+            return msg.ok ? null : { ...picker, saveRequestId: undefined, saveError: msg.error || "Не удалось сохранить настройку API." };
+          });
+          break;
         case "chatProjectRejected": {
           if (!chatId || (pendingProjectRef.current && pendingProjectRef.current !== msg.requestedProjectPath)) break;
           if (!pendingProjectRef.current && bindingRef.current.projectPath !== msg.projectPath) break;
@@ -774,7 +822,8 @@ function ChatTile({
           setProjectSwitching(false);
           activeRef.current = slot.projectPath;
           setActivePath(slot.projectPath);
-          setApiBinding({ apiProfileId: slot.apiProfileId, apiProfileName: slot.apiProfileName, apiProfileModel: slot.apiProfileModel });
+          setApiBinding({ apiProfileId: slot.apiProfileId, apiProfileName: slot.apiProfileName,
+            apiProfileModel: slot.apiProfileModel, apiProfileEffort: slot.apiProfileEffort });
           const pending = pendingAgentRef.current;
           if (!pending || (pending.profileId === undefined && pending.agent === slot.agent && !slot.apiProfileId)) {
             pendingAgentRef.current = null;
@@ -895,6 +944,8 @@ function ChatTile({
           }));
           break;
         case "modelInfo":
+          if (msg.recordId && p === bindingRef.current.projectPath && bindingRef.current.recordId &&
+              msg.recordId !== bindingRef.current.recordId) break;
           setModelsBy((prev) => ({
             ...prev,
             [p]: {
@@ -927,7 +978,8 @@ function ChatTile({
             replaceBinding(p, msg.recordId);
           }
           if (msg.apiProfileId) {
-            setApiBinding({ apiProfileId: msg.apiProfileId, apiProfileName: msg.apiProfileName, apiProfileModel: msg.apiProfileModel });
+            setApiBinding({ apiProfileId: msg.apiProfileId, apiProfileName: msg.apiProfileName,
+              apiProfileModel: msg.apiProfileModel, apiProfileEffort: msg.apiProfileEffort });
           } else if (msg.requestedApiProfileId !== undefined || msg.agent !== "codex") {
             setApiBinding({});
           }
@@ -942,7 +994,12 @@ function ChatTile({
           break;
         }
         case "effortInfo":
-          if (chatId && msg.recordId && msg.recordId !== bindingRef.current.recordId) break;
+          if (msg.recordId && (chatId || p === bindingRef.current.projectPath) &&
+              bindingRef.current.recordId && msg.recordId !== bindingRef.current.recordId) break;
+          if (msg.agent === "codex" && msg.path === bindingRef.current.projectPath && msg.recordId &&
+              msg.recordId === bindingRef.current.recordId) {
+            setApiBinding(prev => prev.apiProfileId ? { ...prev, apiProfileEffort: msg.effort } : prev);
+          }
           setEffortsBy((prev) => ({ ...prev, [p]: { ...prev[p], [msg.agent]: msg.effort } }));
           break;
         case "autoScrollMode":
@@ -1402,6 +1459,7 @@ function ChatTile({
   };
 
   const send = () => {
+    if (apiPicker) return;
     const edit = messageEditRef.current;
     if (edit) {
       if (edit.phase !== "ready" || !editMatchesSource(edit) || busyRef.current[edit.path] || !agentReady ||
@@ -1610,6 +1668,52 @@ function ChatTile({
       post(chatId ? { type: "selectChatAgent", chatId, agent: nextAgent }
         : { type: "selectAgent", agent: nextAgent, path: activePath });
     }
+  };
+
+  const openApiSettings = (action: ApiModelSettingsTarget["action"], trigger: HTMLButtonElement) => {
+    const { projectPath, recordId } = bindingRef.current;
+    const apiProfileId = apiBinding.apiProfileId;
+    if (apiPicker || apiSettingsDisabled || !recordId || projectPath !== activePath || !apiProfileId) return;
+    const target = { action, path: projectPath, recordId, apiProfileId };
+    const requestId = draftId();
+    apiPickerTrigger.current = trigger;
+    setApiPicker({ target, requestId, value: "" });
+    post({ type: "apiModelSettings", ...target, requestId });
+  };
+
+  const apiPickerIsCurrent = !!apiPicker && agentReady && !agentSwitching && !projectSwitching &&
+    (!busy || !!apiPicker.saveRequestId || !!apiPicker.saveError) && !settingsOpen && !archiveOpen &&
+    apiPicker.target.path === activePath && apiPicker.target.recordId === bindingRef.current.recordId &&
+    apiPicker.target.apiProfileId === apiBinding.apiProfileId;
+  useEffect(() => {
+    if (apiPicker && !apiPickerIsCurrent) setApiPicker(null);
+  }, [apiPicker, apiPickerIsCurrent]);
+  useEffect(() => {
+    const dialog = apiDialogRef.current;
+    if (!dialog || !apiPickerIsCurrent) return;
+    dialog.showModal();
+    return () => {
+      dialog.close();
+      apiPickerTrigger.current?.focus();
+    };
+  }, [apiPickerIsCurrent]);
+
+  const saveRequestId = apiPicker?.saveRequestId;
+  useEffect(() => {
+    if (!saveRequestId) return;
+    const timer = setTimeout(() => setApiPicker(picker => picker?.saveRequestId === saveRequestId
+      ? { ...picker, saveRequestId: undefined, saveError: "Подтверждение сохранения не получено. Повторите попытку или закройте окно." }
+      : picker), 20_000);
+    return () => clearTimeout(timer);
+  }, [saveRequestId]);
+
+  const applyApiSetting = () => {
+    if (!apiPickerIsCurrent || !apiPicker?.values || apiPicker.error || saveRequestId || busy || invalidManualModel) return;
+    const value = apiPicker.value.trim();
+    if (value && !apiPicker.manual && !apiPicker.values.includes(value)) return;
+    const requestId = draftId();
+    setApiPicker({ ...apiPicker, saveRequestId: requestId, saveError: undefined });
+    post({ type: "applyApiModelSetting", ...apiPicker.target, requestId, value });
   };
 
   const formatElapsed = (s: number) =>
@@ -2417,19 +2521,20 @@ function ChatTile({
           {sessionId ? `сессия ${sessionId.slice(0, 8)}…` : "новая сессия"}
         </span>
       </header>
-      <div className="statusbar">
+      <div className={apiBinding.apiProfileId ? "statusbar api-statusbar" : "statusbar"}>
         <button
           className={`model-badge ${!apiBinding.apiProfileId && models[agent].fallbackFrom ? "model-fallback" : ""}`}
           title={
-            apiBinding.apiProfileId ? "Модель профиля API для этой сессии" : (models[agent].fallbackFrom
+            apiBinding.apiProfileId ? "Выбрать модель API для следующего хода этой сессии" : (models[agent].fallbackFrom
               ? `Сработал фоллбэк: фактически отвечает ${models[agent].model}, хотя сессия начиналась на ${models[agent].fallbackFrom}. `
               : "") +
             (chatId
               ? "Клик — выбрать модель этой плитки или общую модель. Новая сессия использует правила по умолчанию"
               : "Клик — выбрать модель этой сессии или общую модель провайдера (применится со следующего хода)")
           }
-          disabled={!agentReady || agentSwitching || !!apiBinding.apiProfileId}
-          onClick={() => post({ type: "pickModel", agent })}
+          disabled={apiBinding.apiProfileId ? apiSettingsDisabled : !agentReady || agentSwitching}
+          aria-haspopup={apiBinding.apiProfileId ? "dialog" : undefined}
+          onClick={event => apiBinding.apiProfileId ? openApiSettings("model", event.currentTarget) : post({ type: "pickModel", agent })}
         >
           {apiBinding.apiProfileId ? apiBinding.apiProfileModel ?? apiProvider?.model ?? "Модель профиля API" : models[agent].fallbackFrom
             ? `⚠️ ${models[agent].model} (фоллбэк с ${models[agent].fallbackFrom})`
@@ -2437,12 +2542,13 @@ function ChatTile({
         </button>
         <button
           className="safety-btn"
-          title={apiBinding.apiProfileId ? "Для профиля API выбор effort недоступен" :
+          title={apiBinding.apiProfileId ? "Выбрать глубину размышлений API для следующего хода. Авто — по умолчанию в Codex или у провайдера." :
             "Effort этой сессии — глубина размышлений выбранного агента. Клик — выбрать (применится со следующего хода)"}
-          disabled={!agentReady || agentSwitching || !!apiBinding.apiProfileId}
-          onClick={() => post({ type: "pickEffort", agent })}
+          disabled={apiBinding.apiProfileId ? apiSettingsDisabled : !agentReady || agentSwitching}
+          aria-haspopup={apiBinding.apiProfileId ? "dialog" : undefined}
+          onClick={event => apiBinding.apiProfileId ? openApiSettings("effort", event.currentTarget) : post({ type: "pickEffort", agent })}
         >
-          ⚡ {apiBinding.apiProfileId ? "effort: —" : efforts[agent] || "effort: авто"}
+          ⚡ {apiBinding.apiProfileId ? apiBinding.apiProfileEffort || "Авто" : efforts[agent] || "effort: авто"}
         </button>
         <button
           className={`safety-btn ${safety[agent]?.dangerous ? "safety-danger" : ""}`}
@@ -3028,7 +3134,7 @@ function ChatTile({
                   onClick={() => requestMessageEdit(messageEdit)}>Загрузить снова</button>
               ) : (
                 <button type="button" className="send" onClick={send}
-                  disabled={editBlocked || editFormDisabled || !!messageEdit.missingAttachments.length ||
+                  disabled={!!apiPicker || editBlocked || editFormDisabled || !!messageEdit.missingAttachments.length ||
                     !!messageEdit.pendingUploads.length || (!composerDraft.trim() && !pending.length)}>
                   {messageEdit.phase === "saving" ? "Сохраняю…" : "Сохранить и отправить"}
                 </button>
@@ -3046,7 +3152,7 @@ function ChatTile({
                       : "Сообщение отправится автоматически после ответа агента"
                 }
                 onClick={send}
-                disabled={!agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}
+                disabled={!!apiPicker || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}
               >
                 {sendMode === "now" ? "⚡ Сразу" : sendMode === "next" ? "↪ Докинуть" : "⏳ В очередь"}
               </button>
@@ -3062,12 +3168,77 @@ function ChatTile({
               </button>
             </>
           ) : (
-            <button className="send" onClick={send} disabled={!agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}>
+            <button className="send" onClick={send} disabled={!!apiPicker || !agentReady || agentSwitching || !!currentAttachmentUploads.length || (!draft.trim() && pending.length === 0)}>
               Отправить
             </button>
           )}
         </div>
       </footer>
+      {apiPickerIsCurrent && (
+        <dialog ref={apiDialogRef} className="text-attachment-dialog api-model-dialog" aria-labelledby={apiDialogId}
+          onCancel={event => { event.preventDefault(); if (!saveRequestId) setApiPicker(null); }}>
+          <h2 tabIndex={-1} autoFocus id={apiDialogId}>
+            {apiPicker.target.action === "model" ? "Модель API" : "Глубина размышлений API"}
+          </h2>
+          {apiPicker.error && <p role="alert">{apiPicker.error}</p>}
+          {apiPicker.saveError && <p role="alert">{apiPicker.saveError}</p>}
+          {saveRequestId && <p role="status">Сохранение настройки…</p>}
+          {!apiPicker.values && <p role="status">Загрузка вариантов…</p>}
+          {apiPicker.values && !apiPicker.error && (
+            <>
+              {apiPicker.notice && <p role="status">{apiPicker.notice}</p>}
+              {(apiPicker.target.action === "effort" || apiPicker.values.length > 0) && (
+                <label>
+                  {apiPicker.target.action === "model" ? "Модель для этого чата" : "Уровень для этого чата"}
+                  <select aria-label={apiPicker.target.action === "model" ? "Модель для этого чата" : "Уровень для этого чата"}
+                    disabled={!!saveRequestId || busy}
+                    value={apiPicker.manual ? MANUAL_API_MODEL : apiPicker.value}
+                    aria-describedby={apiPicker.target.action === "effort" ? `${apiDialogId}-hint` : undefined}
+                    onChange={event => {
+                      const manual = event.target.value === MANUAL_API_MODEL;
+                      setApiPicker({ ...apiPicker, manual, value: manual ? "" : event.target.value, saveError: undefined });
+                    }}>
+                    <option value="">Из профиля API</option>
+                    {!apiPicker.manual && apiPicker.value && !apiPicker.values.includes(apiPicker.value) &&
+                      <option value={apiPicker.value} disabled>{apiPicker.value}</option>}
+                    {apiPicker.values.map(value => <option key={value} value={value}>{value}</option>)}
+                    {apiPicker.target.action === "model" && <option value={MANUAL_API_MODEL}>Ввести ID вручную…</option>}
+                  </select>
+                </label>
+              )}
+              {apiPicker.manual && (
+                <>
+                  <label>
+                    ID модели API
+                    <input aria-label="ID модели API" aria-describedby={`${apiDialogId}-hint`}
+                      disabled={!!saveRequestId || busy}
+                      aria-invalid={invalidManualModel} value={apiPicker.value} maxLength={256}
+                      autoComplete="off" autoCapitalize="none" spellCheck={false}
+                      onKeyDown={event => {
+                        if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+                        event.preventDefault();
+                        applyApiSetting();
+                      }}
+                      onChange={event => setApiPicker({ ...apiPicker, value: event.target.value, saveError: undefined })} />
+                  </label>
+                  <p id={`${apiDialogId}-hint`} role={invalidManualModel ? "alert" : undefined}>
+                    {invalidManualModel ? "Введите ID модели без пробелов и управляющих символов." : "Пустое поле вернёт модель из профиля API."}
+                  </p>
+                </>
+              )}
+              {apiPicker.target.action === "effort" && <p id={`${apiDialogId}-hint`}>
+                «Из профиля API» возвращает исходную настройку чата. Если в профиле выбрано «Авто», глубину задаёт Codex или сама модель.
+              </p>}
+            </>
+          )}
+          <div className="text-attachment-actions">
+            <button type="button" disabled={!!saveRequestId} onClick={() => setApiPicker(null)}>{apiPicker.error ? "Закрыть" : "Отмена"}</button>
+            {apiPicker.values && !apiPicker.error && <button type="button" className="text-attachment-save"
+              disabled={!!saveRequestId || busy || invalidManualModel || (!apiPicker.manual && !!apiPicker.value && !apiPicker.values.includes(apiPicker.value))}
+              onClick={applyApiSetting}>Применить</button>}
+          </div>
+        </dialog>
+      )}
       {textAttachment && (
         <dialog ref={textAttachmentDialogRef} className="text-attachment-dialog"
           aria-labelledby={`text-attachment-title-${chatId ?? "main"}`}
@@ -3095,7 +3266,7 @@ function ChatTile({
           </div>
         </dialog>
       )}
-      {choice && (
+      {choice && (choice.kind === "session" || !apiBinding.apiProfileId) && (
         <div className="choice-backdrop" onClick={() => setChoice(null)}>
           <div className="choice-sheet" onClick={(e) => e.stopPropagation()}>
             <div className="choice-title">
@@ -3256,6 +3427,7 @@ function MultiChatBoard() {
                     initialApiProfileId={slot.apiProfileId}
                     initialApiProfileName={slot.apiProfileName}
                     initialApiProfileModel={slot.apiProfileModel}
+                    initialApiProfileEffort={slot.apiProfileEffort}
                   />}
                 </div>
               </section>

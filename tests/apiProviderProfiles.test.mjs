@@ -32,17 +32,29 @@ function fixture() {
   return { records, keys, globalState, secrets, open, store: open() };
 }
 
-test("preset is available on first launch and only its credential can change", async () => {
-  const { store, records } = fixture();
+test("preset fixes its identity and endpoint while persisting model and optional effort defaults", async () => {
+  const { store, records, keys, open } = fixture();
   assert.deepEqual(await store.list(), [{ ...preset, builtIn: true, hasApiKey: false }]);
   await assert.rejects(store.resolve(preset.id));
-  for (const patch of [{ name: "Changed" }, { baseUrl: custom.baseUrl }, { model: "Changed" }]) {
+  for (const patch of [{ name: "Changed" }, { baseUrl: custom.baseUrl }, { effort: "max" }, { effort: [] }]) {
     await assert.rejects(store.save({ ...preset, ...patch, apiKey: "fixture-key" }));
   }
   await assert.rejects(store.remove(preset.id));
   assert.deepEqual(await store.save({ ...preset, apiKey: "fixture-key" }), { ...preset, builtIn: true, hasApiKey: true });
   assert.deepEqual(await store.resolve(preset.id), { ...preset, apiKey: "fixture-key" });
   assert.equal(records.size, 0);
+  const customProfile = await store.save(custom);
+  const savedKeys = [...keys];
+  const defaults = { ...preset, model: "abliterated-model-large-v2", effort: "max" };
+  await store.save(defaults);
+  assert.deepEqual(await open().catalog(), [defaults, { ...custom, id: customProfile.id }]);
+  assert.deepEqual(await open().resolve(preset.id), { ...defaults, apiKey: "fixture-key" });
+  assert.deepEqual([...keys], savedKeys);
+  await store.save({ id: preset.id, apiKey: "fixture-replacement" });
+  assert.deepEqual(await open().resolve(preset.id), { ...defaults, apiKey: "fixture-replacement" });
+  await store.save({ ...preset, model: "my-custom-model" });
+  assert.deepEqual((await open().catalog())[0], { ...preset, model: "my-custom-model" });
+  assert.ok(!JSON.stringify([...records.values()]).includes("fixture-key"));
   await store.clearApiKey(preset.id);
   assert.equal((await store.list())[0].hasApiKey, false);
   await assert.rejects(store.resolve(preset.id));
@@ -57,8 +69,10 @@ test("multiple profiles persist separately, with keys absent from summaries and 
   assert.deepEqual(await open().list(), [{ ...preset, builtIn: true, hasApiKey: false }, first, second]);
   assert.ok(!JSON.stringify([...records.values()]).includes("fixture-key"));
   assert.deepEqual(await open().resolve(first.id), { ...custom, id: first.id, apiKey: "fixture-key-A" });
-  const edited = await store.save({ ...custom, model: "other", id: first.id, apiKey: "" });
+  const edited = await store.save({ ...custom, model: "other", id: first.id, effort: "high", apiKey: "" });
   assert.equal(edited.hasApiKey, true);
+  assert.equal((await open().catalog())[1].effort, "high");
+  await assert.rejects(store.save({ ...custom, id: first.id, effort: "outside-protocol" }));
   assert.equal((await store.resolve(first.id)).apiKey, "fixture-key-A");
   await store.remove(first.id);
   await assert.rejects(store.resolve(first.id));
@@ -93,6 +107,23 @@ test("a changed endpoint (even a different path) requires an explicit replacemen
   assert.equal(local.hasApiKey, false);
   assert.equal((await store.resolve(id)).apiKey, undefined);
   assert.equal(keys.size, 0);
+});
+
+test("changing a key by itself checks the endpoint observed before the prompt", async () => {
+  const { open, secrets } = await desktopFixture();
+  const store = open();
+  const { id } = await store.save({ ...custom, apiKey: "old-address-key" });
+  const newUrl = "https://another.invalid/v2";
+  await open().save({ id, baseUrl: newUrl, apiKey: "new-address-key" });
+  const activeSlots = await secrets.keys();
+  await assert.rejects(store.save({ id, apiKey: "stale-prompt-key" }, custom.baseUrl));
+  await assert.rejects(store.save({ id, apiKey: "unbound-prompt-key" }));
+  await assert.rejects(store.save({ id, baseUrl: custom.baseUrl, apiKey: "stale-form-key" }, custom.baseUrl));
+  await store.save({ id, model: "changed-model", effort: "high" });
+  assert.deepEqual(await open().resolve(id), { ...custom, id, model: "changed-model", effort: "high", baseUrl: newUrl, apiKey: "new-address-key" });
+  assert.deepEqual(await secrets.keys(), activeSlots);
+  await store.save({ id, apiKey: "refreshed-prompt-key" }, newUrl);
+  assert.equal((await open().resolve(id)).apiKey, "refreshed-prompt-key");
 });
 
 test("unauthenticated local endpoints work; http, fragments, credentials, and unbounded inputs are validated", async () => {
@@ -139,7 +170,8 @@ test("invalid, duplicated or oversized persisted metadata fails closed without a
   const profile = await store.save(custom);
   const [storageKey, initial] = [...records][0];
   const raw = JSON.stringify(initial);
-  for (const damaged of [null, {}, JSON.parse(raw.replace(profile.id, preset.id)), JSON.parse(raw.replace(custom.baseUrl, "http://remote.invalid"))]) {
+  for (const damaged of [null, {}, [preset, preset], [{ ...preset, effort: "max" }],
+    JSON.parse(raw.replace(profile.id, preset.id)), JSON.parse(raw.replace(custom.baseUrl, "http://remote.invalid"))]) {
     records.set(storageKey, damaged);
     await assert.rejects(store.list());
     await assert.rejects(store.save(custom));
@@ -147,17 +179,26 @@ test("invalid, duplicated or oversized persisted metadata fails closed without a
   }
   records.set(storageKey, initial);
   for (let i = 1; i < 50; i++) await store.save(custom);
+  await store.save({ id: preset.id, model: preset.model, effort: "high" });
   await assert.rejects(store.save(custom));
   assert.equal((await store.list()).length, 51);
 });
 
-test("the native manager adds the preset key with a masked input and preserves it on cancel", async t => {
+test("native settings change defaults without prompting for or exposing the preset key", async t => {
   const managerFile = join(temp, "settings.mjs");
   const symbol = Symbol.for("agent-hub-test.api-provider-settings");
   const prompts = [];
   const answers = ["fixture-manager-key", undefined];
+  const picks = [];
   globalThis[symbol] = {
-    showQuickPick: async items => items[0],
+    showQuickPick: async items => {
+      const select = picks.shift();
+      if (select === null) return undefined;
+      if (select === undefined) return items[0];
+      const item = items.find(select);
+      assert.ok(item, "requested option is visible");
+      return item;
+    },
     showInputBox: async options => { prompts.push(options); return answers.shift(); },
     showInformationMessage: async () => {},
   };
@@ -174,12 +215,50 @@ test("the native manager adds the preset key with a masked input and preserves i
   });
   const { manageApiProviderSettings } = await import(pathToFileURL(managerFile).href);
   const { store } = fixture();
+  const presetPick = item => item.profile?.id === preset.id;
+  const editKey = item => item.action === "key";
+  const defaults = item => item.action === "defaults";
+  const model = item => item.value === "abliterated-model-large-v2";
+  const effort = item => item.value === "max";
+  picks.push(presetPick, editKey);
   await manageApiProviderSettings(store);
+  picks.push(presetPick, editKey);
   await manageApiProviderSettings(store);
-  assert.equal((await store.resolve(preset.id)).apiKey, "fixture-manager-key");
+  picks.push(presetPick, defaults, model, null);
+  await manageApiProviderSettings(store);
+  assert.deepEqual(await store.resolve(preset.id), { ...preset, apiKey: "fixture-manager-key" });
+  picks.push(presetPick, defaults, model, effort);
+  await manageApiProviderSettings(store);
+  assert.deepEqual(await store.resolve(preset.id), { ...preset, model: "abliterated-model-large-v2", effort: "max", apiKey: "fixture-manager-key" });
+  picks.push(presetPick, defaults, model, item => item.value === "");
+  await manageApiProviderSettings(store);
+  assert.deepEqual(await store.resolve(preset.id), { ...preset, model: "abliterated-model-large-v2", apiKey: "fixture-manager-key" });
   assert.equal(prompts.length, 2);
   assert.ok(prompts.every(p => p.password === true && p.value === undefined));
   assert.ok(!JSON.stringify(prompts).includes("fixture-manager-key"));
+  picks.push(presetPick, defaults, item => item.value === "", item => item.value === "");
+  answers.push("org/custom:7b");
+  await manageApiProviderSettings(store);
+  assert.equal((await store.resolve(preset.id)).model, "org/custom:7b");
+  assert.equal(prompts.at(-1).validateInput("model\nother")?.length > 0, true);
+
+  const { id } = await store.save({ ...custom, apiKey: "current-key" });
+  picks.push(item => item.profile?.id === id, item => item.action === "edit");
+  globalThis[symbol].showInputBox = async options => {
+    if (!options.password) return options.value;
+    await store.save({ id, baseUrl: "https://another.invalid/v1", apiKey: "other-address-key" });
+    return "stale-dialog-key";
+  };
+  await assert.rejects(manageApiProviderSettings(store));
+  assert.equal((await store.resolve(id)).baseUrl, "https://another.invalid/v1");
+  assert.equal((await store.resolve(id)).apiKey, "other-address-key");
+  picks.push(item => item.profile?.id === id, defaults, item => item.value === "high");
+  globalThis[symbol].showInputBox = async () => {
+    await store.save({ id, baseUrl: "https://third.invalid/v1", apiKey: "third-address-key" });
+    return "stale-model";
+  };
+  await assert.rejects(manageApiProviderSettings(store));
+  assert.equal((await store.resolve(id)).model, custom.model);
 });
 
 function diskSecrets(directory, afterStore = async () => {}) {
@@ -282,16 +361,23 @@ test("a killed host releases its writer lock, preserves the previous bound key, 
 
 test("desktop migration reads legacy metadata once and chat hydration never opens the secret store", async () => {
   const { root, open, secrets } = await desktopFixture();
-  const legacy = { ...custom, id: "02468ace-0101-4210-8221-012345679abc" };
+  const legacy = { ...custom, model: "Legacy name with spaces", id: "02468ace-0101-4210-8221-012345679abc" };
   const state = { get: () => [legacy] };
   const forbidden = () => assert.fail("catalog must only read public metadata");
   const reader = new ApiProviderProfileStore(state, { get:forbidden, keys:forbidden, store:forbidden, delete:forbidden }, root);
   assert.deepEqual(await reader.catalog(), [preset, legacy]);
   await secrets.store("agentHub.apiProviderKey.v1:" + legacy.id, JSON.stringify({ baseUrl:custom.baseUrl, apiKey:"legacy-fixture" }));
+  await secrets.store("agentHub.apiProviderKey.v1:" + preset.id, JSON.stringify({ baseUrl:preset.baseUrl, apiKey:"preset-legacy-fixture" }));
   state.get = forbidden;
   assert.equal((await open(state).resolve(legacy.id)).apiKey, "legacy-fixture");
+  const keysBefore = await secrets.keys();
+  await open(state).save({ id: preset.id, model: preset.model, effort: "high" });
+  assert.deepEqual(await reader.catalog(), [{ ...preset, effort: "high" }, legacy]);
+  assert.deepEqual(await open(state).resolve(preset.id), { ...preset, effort: "high", apiKey: "preset-legacy-fixture" });
+  assert.deepEqual(await secrets.keys(), keysBefore);
   await open(state).remove(legacy.id);
-  assert.deepEqual(await reader.catalog(), [preset]);
+  assert.deepEqual(await reader.catalog(), [{ ...preset, effort: "high" }]);
+  await open(state).clearApiKey(preset.id);
   assert.deepEqual(await secrets.keys(), []);
 });
 
