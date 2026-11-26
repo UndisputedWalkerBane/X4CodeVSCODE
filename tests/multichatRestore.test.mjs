@@ -56,6 +56,7 @@ function panelFixture() {
     webview: { options: {}, html: "", postMessage: (message) => { messages.push(message); },
       onDidReceiveMessage: (fn) => { receives.add(fn); return { dispose: () => receives.delete(fn) }; } },
     onDidDispose: (fn) => { disposals.add(fn); return { dispose: () => disposals.delete(fn) }; },
+    onDidChangeViewState: () => ({ dispose() {} }),
     reveal() { panel.reveals++; },
     dispose() { panel.disposed = true; for (const fn of [...disposals]) fn(); },
     async send(message) { for (const fn of receives) await fn(message); },

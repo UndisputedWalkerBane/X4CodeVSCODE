@@ -8,7 +8,16 @@ import { build } from "esbuild";
 
 const temp = await mkdtemp(join(tmpdir(), "agent-hub-access-ui-"));
 const hookKey = Symbol.for("agent-hub-access-ui-hooks");
-after(async () => { delete globalThis[hookKey]; await rm(temp, { recursive: true, force: true }); });
+const originalGlobals = new Map(["window", "document"].map(key => [key, globalThis[key]]));
+const origin = "https://webview.invalid";
+globalThis.window = Object.assign(new EventTarget(), { origin });
+globalThis.document = Object.assign(new EventTarget(), { visibilityState: "visible" });
+const hostMessage = (data, eventOrigin = origin) => window.dispatchEvent(new MessageEvent("message", { data, origin: eventOrigin }));
+after(async () => {
+  delete globalThis[hookKey];
+  for (const [key, value] of originalGlobals) { if (value === undefined) delete globalThis[key]; else globalThis[key] = value; }
+  await rm(temp, { recursive: true, force: true });
+});
 const outfile = join(temp, "accesses.mjs");
 await build({
   entryPoints: [fileURLToPath(new URL("../webview/ProjectAccesses.tsx", import.meta.url))], outfile, bundle: true, platform: "node", format: "esm",
@@ -25,7 +34,7 @@ const summary = (patch = {}) => ({ id: "access-one", name: "Production", purpose
 const textOf = node => node == null || typeof node === "boolean" ? "" : Array.isArray(node) ? node.map(textOf).join("") : typeof node === "object" ? textOf(node.props?.children) : String(node);
 function nodes(node) { return Array.isArray(node) ? node.flatMap(nodes) : node && typeof node === "object" ? [node, ...nodes(node.props?.children)] : []; }
 const harnesses = [];
-afterEach(() => { harnesses.splice(0).forEach(h => h.dispose()); });
+afterEach(() => { harnesses.splice(0).forEach(h => h.dispose()); document.visibilityState = "visible"; });
 function harness(props = {}) {
   const slots = []; let cursor = 0, dirty = false, effects = [];
   const elements = new WeakMap(); let committedRefs = new Set();
@@ -68,6 +77,11 @@ function harness(props = {}) {
     if (input.props.ref?.current) { input.props.ref.current.value = value; input.props.ref.current.validity = { badInput: false, valid: true }; }
     input.props.onChange({ target: { value } }); h.render(); };
   h.respond = (patch = {}) => { const request = h.commands.at(-1); h.props.snapshot = { type: "projectAccesses", projectPath: h.props.projectPath, requestId: request.requestId, revision: 0, entries: [], ...(h.props.chatId ? { chatId: h.props.chatId } : {}), ...patch }; h.render(); };
+  h.revealReply = (request, patch = {}, eventOrigin = origin) => {
+    const data = { type: "projectAccessRevealed", projectPath: request.projectPath, chatId: h.props.chatId,
+      requestId: request.requestId, revision: request.expectedRevision, id: request.id, ...patch };
+    hostMessage(data, eventOrigin); h.render();
+  };
   h.testRespond = (patch = {}) => { const request = h.commands.filter(command => command.type === "testProjectAccess").at(-1); assert.ok(request, "missing access test request");
     h.props.testResult = { type: "projectAccessTestResult", projectPath: request.projectPath, requestId: request.requestId, revision: request.expectedRevision,
       id: request.access.id, protocol: request.access.protocol, ok: true, message: "Fixture connection succeeded", ...(h.props.chatId ? { chatId: h.props.chatId } : {}), ...patch }; h.render(); };
@@ -85,6 +99,169 @@ test("requests metadata on mount and loads named cards without any stored values
   for (const field of fields) assert.equal(h.input(field).props.value, "");
   assert.equal(h.input("password").props.type, "password"); assert.equal(h.input("apiKey").props.type, "password");
   for (const input of h.all("input").filter(node => node.props.type !== "checkbox")) assert.ok(h.all("label").some(label => label.props.htmlFor === input.props.id));
+});
+
+const fixtureValues = { url: "https://service.invalid/fixture", login: "  Логин\nfixture  ", password: '<fixture>&"пароль"', apiKey: "fixture-" + "ABC".repeat(500) };
+const twoEntries = [summary(), summary({ id: "access-two", name: "Staging", hasValues: { url: false, login: true, password: false, apiKey: false } })];
+
+test("only the requested card shows exact saved values and Hide removes them from the rendered page", () => {
+  const h = harness({ chatId: "access-chat" });
+  h.respond({ revision: 7, entries: twoEntries });
+  const button = h.button("Показать данные: Production");
+  assert.ok(button);
+  assert.equal(textOf(button), "Показать");
+  assert.equal(button.props["aria-expanded"], false);
+  assert.equal(h.commands.length, 1);
+  h.click("Показать данные: Production");
+  const request = h.commands.at(-1);
+  assert.deepEqual(request, { type: "revealProjectAccess", projectPath: "project-one", id: "access-one", expectedRevision: 7, requestId: request.requestId, chatId: "access-chat" });
+  assert.ok(request.requestId);
+  for (const patch of [{ id: "access-two" }, { requestId: "wrong" }, { projectPath: "other" }, { chatId: "other" }, { chatId: undefined }, { revision: 6 }]) {
+    h.revealReply(request, { values: fixtureValues, ...patch });
+    assert.ok(!textOf(h.tree).includes(fixtureValues.password));
+  }
+  h.revealReply(request, { values: fixtureValues }, "https://unrelated.invalid");
+  assert.ok(!textOf(h.tree).includes(fixtureValues.password));
+  h.revealReply(request, { values: fixtureValues });
+  const hide = h.button("Скрыть данные: Production");
+  assert.equal(textOf(hide), "Скрыть");
+  assert.equal(hide.props["aria-expanded"], true);
+  assert.ok(h.all("dl").some(node => node.props.id === hide.props["aria-controls"]));
+  for (const value of Object.values(fixtureValues)) {
+    assert.ok(nodes(h.all("article")[0]).some(node => node.type === "dd" && textOf(node) === value));
+    assert.ok(!textOf(h.all("article")[1]).includes(value));
+  }
+  h.click("Скрыть данные: Production");
+  h.revealReply(request, { values: fixtureValues });
+  assert.equal(h.commands.length, 2);
+  for (const value of Object.values(fixtureValues)) assert.ok(!textOf(h.tree).includes(value));
+});
+
+test("switching cards or hiding a pending request prevents older responses from showing values", () => {
+  const h = harness(); h.respond({ revision: 3, entries: twoEntries });
+  h.click("Показать данные: Production"); const first = h.commands.at(-1);
+  h.click("Показать данные: Staging"); const second = h.commands.at(-1);
+  h.revealReply(first, { values: fixtureValues });
+  assert.ok(!textOf(h.tree).includes(fixtureValues.login));
+  h.revealReply(second, { values: { login: fixtureValues.login } });
+  assert.ok(textOf(h.all("article")[1]).includes(fixtureValues.login));
+  assert.ok(textOf(h.all("article")[1]).includes("не задано"));
+  h.click("Показать данные: Production"); const third = h.commands.at(-1);
+  assert.ok(!textOf(h.tree).includes(fixtureValues.login));
+  h.click("Скрыть данные: Production");
+  h.revealReply(third, { values: fixtureValues });
+  assert.ok(!textOf(h.tree).includes(fixtureValues.login));
+});
+
+for (const transition of ["edit", "project", "chat", "revision", "hidden"]) {
+  test(`a ${transition} change masks the current card and invalidates its reveal request`, () => {
+    const h = harness(); h.respond({ revision: 3, entries: twoEntries });
+    h.click("Показать данные: Production"); const old = h.commands.at(-1);
+    h.revealReply(old, { values: fixtureValues });
+    assert.ok(textOf(h.tree).includes(fixtureValues.password));
+    if (transition === "edit") h.click("Изменить Production");
+    if (transition === "project") { h.props.projectPath = "project-two"; h.render(); }
+    if (transition === "chat") { h.props.chatId = "new-chat"; h.render(); }
+    if (transition === "revision") h.respond({ requestId: "another-editor", revision: 4, entries: twoEntries });
+    if (transition === "hidden") { document.visibilityState = "hidden"; document.dispatchEvent(new Event("visibilitychange")); h.render(); }
+    h.revealReply(old, { chatId: undefined, values: fixtureValues });
+    assert.ok(!textOf(h.tree).includes(fixtureValues.password));
+    if (transition === "edit") assert.equal(h.input("password").props.value, "");
+  });
+}
+
+test("a reveal response that arrives while the webview is hidden stays masked when the view is reopened", () => {
+  const h = harness(); h.respond({ revision: 3, entries: twoEntries });
+  h.click("Показать данные: Production"); const request = h.commands.at(-1);
+  document.visibilityState = "hidden"; document.dispatchEvent(new Event("visibilitychange")); h.render();
+  h.revealReply(request, { values: fixtureValues });
+  document.visibilityState = "visible"; document.dispatchEvent(new Event("visibilitychange")); h.render();
+  assert.ok(h.button("Показать данные: Production"));
+  assert.ok(!textOf(h.tree).includes(fixtureValues.password));
+});
+
+test("a newer project broadcast masks sibling chat tiles, ignores other projects and keeps draft values", () => {
+  const first = harness({ chatId: "first" }), sibling = harness({ chatId: "sibling" });
+  const other = harness({ chatId: "other", projectPath: "other-project" }), editor = harness({ chatId: "editor" });
+  const tiles = [first, sibling, other, editor];
+  for (const h of tiles) h.respond({ revision: 3, entries: twoEntries });
+  for (const h of [first, sibling, other]) h.click("Показать данные: Production");
+  const pending = sibling.commands.at(-1);
+  for (const h of [first, other]) h.revealReply(h.commands.at(-1), { values: fixtureValues });
+  editor.click("Изменить Production"); editor.edit("password", "draft-fixture");
+  const changed = { type: "projectAccessRevisionChanged", projectPath: first.props.projectPath, revision: 4 };
+  for (const [data, eventOrigin] of [[changed, "https://other.invalid"], [{ ...changed, revision: 3 }, origin]]) {
+    hostMessage(data, eventOrigin); first.render();
+    assert.ok(textOf(first.tree).includes(fixtureValues.password));
+  }
+  hostMessage(changed); tiles.forEach(h => h.render());
+  sibling.revealReply(pending, { values: fixtureValues });
+  assert.ok(!textOf(first.tree).includes(fixtureValues.password)); assert.ok(first.button("Показать данные: Production"));
+  assert.ok(!textOf(sibling.tree).includes(fixtureValues.password)); assert.ok(sibling.button("Показать данные: Production"));
+  assert.ok(textOf(other.tree).includes(fixtureValues.password));
+  assert.equal(editor.input("password").props.value, "draft-fixture");
+  for (const h of tiles) assert.equal(h.commands.filter(message => message.type === "revealProjectAccess").length, h === editor ? 0 : 1);
+  for (const h of [other, editor]) assert.equal(h.commands.filter(message => message.type === "getProjectAccesses").length, 1);
+  editor.click("Сохранить доступ"); assert.equal(editor.commands.at(-1).expectedRevision, 3);
+});
+
+test("the first Show after sibling saves uses fresh card metadata, including a second change during refresh", () => {
+  const h = harness({ chatId: "idle-tile" }); h.respond({ revision: 3, entries: twoEntries });
+  const announce = revision => { hostMessage({ type: "projectAccessRevisionChanged", projectPath: h.props.projectPath, revision }); h.render(); };
+  announce(4);
+  assert.deepEqual(h.commands.map(command => command.type), ["getProjectAccesses", "getProjectAccesses"]);
+  announce(5);
+  assert.equal(h.commands.length, 2);
+  h.respond({ revision: 4, entries: twoEntries });
+  assert.equal(h.commands.length, 3);
+  assert.equal(h.commands.at(-1).type, "getProjectAccesses");
+  h.respond({ revision: 5, entries: [summary({ name: "Renamed service" })] });
+  assert.equal(h.button("Показать данные: Production"), undefined);
+  h.click("Показать данные: Renamed service");
+  const request = h.commands.at(-1);
+  assert.equal(request.type, "revealProjectAccess"); assert.equal(request.expectedRevision, 5);
+  h.revealReply(request, { values: fixtureValues });
+  assert.ok(textOf(h.tree).includes(fixtureValues.password));
+  assert.equal(h.commands.filter(message => message.type === "revealProjectAccess").length, 1);
+});
+
+for (const completed of [false, true]) test(`a native surface hide clears a ${completed ? "completed" : "pending"} reveal while the DOM still reports visible`, () => {
+  const h = harness({ chatId: "retained" }); h.respond({ revision: 3, entries: twoEntries });
+  h.click("Показать данные: Production"); const request = h.commands.at(-1);
+  if (completed) h.revealReply(request, { values: fixtureValues });
+  hostMessage({ type: "hideProjectAccessValues" }, "https://unrelated.invalid"); h.render();
+  assert.ok(h.button("Скрыть данные: Production"));
+  hostMessage({ type: "hideProjectAccessValues" }); h.render();
+  h.revealReply(request, { values: fixtureValues });
+  assert.equal(document.visibilityState, "visible"); assert.ok(h.button("Показать данные: Production"));
+  assert.ok(!textOf(h.tree).includes(fixtureValues.password)); assert.equal(h.commands.length, 2);
+});
+
+for (const completed of [false, true]) test(`covering a tile with the board archive clears its ${completed ? "displayed" : "pending"} reveal and keeps its editor mounted`, () => {
+  const h = harness(); h.respond({ revision: 3, entries: twoEntries });
+  h.click("Показать данные: Production"); const request = h.commands.at(-1);
+  if (completed) h.revealReply(request, { values: fixtureValues });
+  h.props.visible = false; h.render();
+  h.revealReply(request, { values: fixtureValues });
+  h.props.visible = true; h.render();
+  assert.ok(h.button("Показать данные: Production")); assert.ok(!textOf(h.tree).includes(fixtureValues.password));
+  h.click("Изменить Production"); h.edit("password", "fixture-board-draft");
+  h.props.visible = false; h.render(); h.props.visible = true; h.render();
+  assert.equal(h.input("password").props.value, "fixture-board-draft");
+  assert.equal(h.commands.length, 2);
+});
+
+test("a reveal storage error and a revision conflict both allow explicit retry", () => {
+  const h = harness(); h.respond({ revision: 3, entries: twoEntries });
+  h.click("Показать данные: Production");
+  h.revealReply(h.commands.at(-1), { revision: 0, error: "Fixture storage unavailable" });
+  assert.ok(nodes(h.tree).some(node => node.props.role === "alert" && textOf(node).includes("Fixture storage unavailable")));
+  h.click("Показать данные: Production");
+  h.revealReply(h.commands.at(-1), { revision: 4, error: "Fixture revision conflict" });
+  assert.equal(h.commands.at(-1).type, "getProjectAccesses");
+  h.respond({ revision: 4, entries: twoEntries });
+  h.click("Показать данные: Production");
+  assert.equal(h.commands.at(-1).expectedRevision, 4);
 });
 
 test("adding is local until Save and successful saving clears every credential draft", () => {

@@ -1,4 +1,4 @@
-/** Public card metadata. Saved values never cross the host/webview boundary. */
+/** Fields stored in SecretStorage and available on explicit local reveal. */
 export type ProjectAccessField = "url" | "login" | "password" | "apiKey";
 export type ProjectAccessProtocol = "ssh" | "sftp" | "ftp";
 export type ProjectAccessConnectionField = "url" | "login" | "password";

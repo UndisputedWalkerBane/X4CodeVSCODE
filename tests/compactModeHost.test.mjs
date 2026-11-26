@@ -31,6 +31,7 @@ function panelFixture() {
   const handlers = new Set(), disposals = new Set();
   const panel = { messages: [], handlers, webview: { options: {}, html: "", postMessage: (event) => panel.messages.push(event), onDidReceiveMessage: (handler) => { handlers.add(handler); return { dispose: () => handlers.delete(handler) }; } },
     onDidDispose: (handler) => { disposals.add(handler); return { dispose: () => disposals.delete(handler) }; }, reveal() {},
+    onDidChangeViewState: () => ({ dispose() {} }),
     dispose() { for (const handler of [...disposals]) handler(); }, async send(message) { for (const handler of handlers) await handler(message); } };
   return panel;
 }

@@ -138,3 +138,66 @@ test("inline connection checks are chat scoped and never reset the separate sett
   h.deliver({ ...result, chatId }); assert.ok(textOf(h.editor).includes(result.message)); assert.equal(serverPassword().props.value, "fake-primary-check-password");
   assert.equal(commands.some(message => ["saveSettings", "saveProjectAccess", "send", "steer"].includes(message.type)), false); h.dispose();
 });
+
+test("only the requesting settings tile reveals values, and reopening settings starts masked", () => {
+  const chatId = "access-reveal-chat";
+  const h = setup({ chatId, initialProjectPath: project.id, initialRecordId: "record-one" });
+  h.respond();
+  const password = "fixture-only-P@55<test>";
+  assert.equal(commands.some(message => message.type === "revealProjectAccess"), false);
+  h.click("Показать данные: Metrics", true);
+  const request = commands.at(-1);
+  assert.deepEqual(request, {
+    type: "revealProjectAccess", chatId, projectPath: project.id, id: summary.id,
+    expectedRevision: 1, requestId: request.requestId,
+  });
+  const response = { type: "projectAccessRevealed", chatId, projectPath: project.id, id: summary.id,
+    revision: 1, requestId: request.requestId, values: { url: "SYNTHETIC.example", login: "fixture-user", password } };
+  h.deliver({ ...response, chatId: "other-tile" });
+  assert.equal(textOf(h.editor).includes(password), false);
+  h.deliver(response);
+  assert.ok(textOf(h.editor).includes(password));
+  h.click("← Назад");
+  h.click("⚙");
+  h.respond();
+  h.deliver(response);
+  assert.equal(textOf(h.editor).includes(password), false);
+  assert.ok(h.button("Показать данные: Metrics", true));
+  assert.equal(JSON.stringify([commands, persisted]).includes(password), false);
+  h.dispose();
+});
+
+test("changing the active project masks an open card even before the next settings snapshot", () => {
+  const h = setup();
+  h.respond();
+  const password = "fixture-old-project-only";
+  h.click("Показать данные: Metrics", true);
+  const response = { type: "projectAccessRevealed", projectPath: project.id, id: summary.id, revision: 1,
+    requestId: commands.at(-1).requestId, values: { password } };
+  h.deliver(response);
+  assert.ok(textOf(h.editor).includes(password));
+  h.deliver({ type: "projects", projects: [project, otherProject], activePath: otherProject.id });
+  h.deliver(response);
+  assert.equal(textOf(h.editor).includes(password), false);
+  h.dispose();
+});
+
+test("a retained tile discards a reveal when the board opens its archive", () => {
+  const props = { chatId: "archive-tile", initialProjectPath: project.id, initialRecordId: "record-one", boardArchiveOpen: false };
+  const h = setup(props);
+  h.respond();
+  const password = "fixture-archive-only";
+  h.click("Показать данные: Metrics", true);
+  const response = { type: "projectAccessRevealed", chatId: props.chatId, projectPath: project.id,
+    id: summary.id, revision: 1, requestId: commands.at(-1).requestId, values: { password } };
+  h.deliver(response);
+  assert.ok(textOf(h.editor).includes(password));
+  props.boardArchiveOpen = true;
+  h.render();
+  h.deliver(response);
+  props.boardArchiveOpen = false;
+  h.render();
+  assert.equal(textOf(h.editor).includes(password), false);
+  assert.ok(h.button("Показать данные: Metrics", true));
+  h.dispose();
+});

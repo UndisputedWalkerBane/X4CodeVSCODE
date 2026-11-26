@@ -17,7 +17,7 @@ await build({ entryPoints: [fileURLToPath(new URL("../src/ChatViewProvider.ts", 
     b.onResolve({ filter: /^(vscode|qrcode|node:child_process)$|^\.\/agents\/|^\.\/remoteServer$|^\.\/journal$|^\.\/serverConnection$/ }, ({ path }) => ({ path, namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, ({ path }) => {
       const h = 'globalThis[Symbol.for("agent-hub-access-host-tests")].current';
-      if (path === "vscode") return { contents: `import {rename} from "node:fs/promises";export const workspace={workspaceFolders:[],getConfiguration:(section)=>${h}.configuration(section),fs:{rename:async(source,destination)=>rename(source.fsPath,destination.fsPath),delete:async(uri)=>${h}.deleted.push(uri.fsPath)}};export const window={showWarningMessage:async()=>${h}.choices.shift(),showInformationMessage:async()=>{},showErrorMessage:(message)=>${h}.errors.push(message)};export const Uri={file:(fsPath)=>({fsPath})},commands={executeCommand:async()=>{}},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={};export class ThemeIcon{};` };
+      if (path === "vscode") return { contents: `import {rename} from "node:fs/promises";export const workspace={workspaceFolders:[],getConfiguration:(section)=>${h}.configuration(section),fs:{rename:async(source,destination)=>rename(source.fsPath,destination.fsPath),delete:async(uri)=>${h}.deleted.push(uri.fsPath)}};export const window={createWebviewPanel:()=>${h}.createPanel(),showWarningMessage:async()=>${h}.choices.shift(),showInformationMessage:async()=>{},showErrorMessage:(message)=>${h}.errors.push(message)};export const Uri={file:(fsPath)=>({fsPath}),joinPath:(...parts)=>parts.join("/")},commands={executeCommand:async()=>{}},ViewColumn={},ConfigurationTarget={Global:1},ProgressLocation={},env={};export class ThemeIcon{};` };
       if (path === "node:child_process") return { contents: 'export const spawn=()=>{throw new Error("unexpected external process")};' };
       if (path === "./journal") return { contents: 'export const readJournalContext=async()=>"";export const buildFinishPrompt=()=>"";' };
       if (path === "./serverConnection") return { resolveDir: fileURLToPath(new URL("../src/", import.meta.url)), contents: `export {buildServerEnvironment,formatSshCommand} from ${JSON.stringify(fileURLToPath(new URL("../src/serverConnection.ts", import.meta.url)))};export const testServerConnection=async(connection,password)=>{${h}.serverTests.push({connection,password});return ${h}.probe ? await ${h}.probe(connection,password) : {ok:true,message:"fixture"};};` };
@@ -55,6 +55,8 @@ function setup() {
   h.p = p; h.send = (msg, surface = "multi-panel", source = "vscode") => p.onMessage(msg, source, { send: message => h.messages.push(message) }, surface);
   h.request = (patch = {}) => ({ type: "saveProjectAccess", projectPath: projects[0].id, chatId: slots[0].chatId, requestId: "access-save-1", expectedRevision: 0, access: { name: " Database ", purpose: " Read reports ", values: { password: " fixture-secret\n`$'🔑 ", url: "fixture-private-url" } }, ...patch });
   h.responses = () => h.messages.filter(m => m.type === "projectAccesses");
+  h.revealRequest = (patch = {}) => ({ type: "revealProjectAccess", projectPath: projects[0].id,
+    chatId: slots[0].chatId, requestId: "reveal-1", expectedRevision: 1, id, ...patch });
   h.probeRequest = (patch = {}) => ({ type: "testProjectAccess", projectPath: projects[0].id, chatId: slots[0].chatId, requestId: "probe-1", expectedRevision: 1, access: { id, protocol: "ssh", values: {} }, ...patch });
   h.probeResponses = () => h.messages.filter(m => m.type === "projectAccessTestResult");
   return h;
@@ -66,6 +68,206 @@ function connectionStore() {
   Object.assign(store.entries[0].values, { url: "protected-host.example", login: "card-user", apiKey: "card-api-never-password" });
   return JSON.stringify(store);
 }
+
+function localSurfaces(h) {
+  const messages = { view: [], panel: [], "multi-panel": [], remote: [] };
+  for (const [surface, property] of [["view", "view"], ["panel", "panel"], ["multi-panel", "multiPanel"]]) {
+    h.p[property] = { webview: { postMessage: msg => messages[surface].push(msg) } };
+  }
+  h.p.remote = { broadcast: msg => messages.remote.push(msg) };
+  return messages;
+}
+
+test("explicit reveal returns only the selected card to the requesting local surface", async () => {
+  for (const surface of ["view", "panel", "multi-panel"]) {
+    const h = setup(), messages = localSurfaces(h);
+    const store = JSON.parse(connectionStore()), selected = store.entries[0];
+    store.entries.push({ ...selected, id: "87654321-1234-4234-8234-123456789abc", values: { password: "other-card" } });
+    h.secrets.set(cardsKey(h.projects[0].id), JSON.stringify(store));
+    const request = h.revealRequest({ chatId: surface === "multi-panel" ? h.slots[0].chatId : undefined });
+    await h.send(request, surface);
+    assert.deepEqual(messages[surface], [{ type: "projectAccessRevealed", projectPath: request.projectPath,
+      requestId: request.requestId, id, revision: 1, values: selected.values, ...(request.chatId ? { chatId: request.chatId } : {}) }]);
+    for (const [name, events] of Object.entries(messages)) if (name !== surface) assert.deepEqual(events, []);
+    assert.deepEqual(h.messages, []); assert.deepEqual(h.reads, [cardsKey(h.projects[0].id)]); assert.deepEqual(h.writes, []);
+  }
+});
+
+test("remote and unaddressed reveal requests cannot read card storage or deliver values", async () => {
+  const h = setup(), messages = localSurfaces(h);
+  h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  await h.send(h.revealRequest(), "multi-panel", "remote");
+  assert.equal(h.messages[0]?.type, "info");
+  await h.p.onMessage(h.revealRequest({ chatId: undefined }), "vscode");
+  h.p.view = undefined;
+  await h.send(h.revealRequest({ chatId: undefined }), "view");
+  assert.deepEqual(h.reads, []); assert.deepEqual(Object.values(messages).flat(), []);
+});
+
+test("reveal errors for invalid addresses, revisions, missing cards and storage failures contain no values", async () => {
+  for (const [patch, read] of [
+    [{ projectPath: "project-two" }, false], [{ chatId: undefined }, false], [{ requestId: "" }, false],
+    [{ id: null }, false], [{ expectedRevision: "1" }, false], [{ expectedRevision: 0 }, true],
+    [{ id: "87654321-1234-4234-8234-123456789abc" }, true], [{}, true],
+  ]) {
+    const h = setup(), messages = localSurfaces(h), request = h.revealRequest(patch);
+    h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    if (!Object.keys(patch).length) h.beforeGet = () => { throw new Error("fixture-secret"); };
+    await h.send(request);
+    const [response] = messages["multi-panel"];
+    assert.equal(response?.type, "projectAccessRevealed"); assert.ok(response.error); assert.equal("values" in response, false);
+    assert.equal(JSON.stringify(response).includes("fixture-secret"), false); assert.equal(h.reads.length, Number(read));
+    assert.deepEqual([...messages.view, ...messages.panel, ...messages.remote, ...h.messages], []);
+  }
+});
+
+test("a pending reveal cannot disclose values after project rebinding, panel replacement or disposal", async () => {
+  for (const change of ["rebind", "replace", "dispose"]) {
+    const h = setup(), messages = localSurfaces(h), replacement = [];
+    h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    h.beforeGet = async () => {
+      if (change === "rebind") await h.p.saveChatSlots([{ ...h.slots[0], projectPath: h.projects[1].id }, h.slots[1]]);
+      else h.p.multiPanel = change === "replace" ? { webview: { postMessage: msg => replacement.push(msg) } } : null;
+    };
+    await h.send(h.revealRequest());
+    const results = messages["multi-panel"];
+    if (change === "rebind") {
+      assert.ok(results[0]?.error); assert.equal(results[0].projectPath, h.projects[0].id); assert.equal("values" in results[0], false);
+    } else assert.deepEqual(results, []);
+    assert.deepEqual([...messages.view, ...messages.panel, ...messages.remote, ...h.messages, ...replacement], []);
+  }
+});
+
+test("reveals queued behind a save reject the old revision after the write commits", async () => {
+  const h = setup(), messages = localSurfaces(h), entered = gate(), release = gate();
+  h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.beforeStore = async () => { entered.resolve(); await release.promise; };
+  const save = h.send(h.request({ expectedRevision: 1, access: { ...h.request().access, id } }));
+  await entered.promise;
+  const reveal = h.send(h.revealRequest());
+  await tick(); assert.deepEqual(messages["multi-panel"], []);
+  release.resolve(); await Promise.all([save, reveal]);
+  const result = messages["multi-panel"].find(m => m.type === "projectAccessRevealed");
+  assert.ok(result?.error); assert.equal(result.revision, 2); assert.equal("values" in result, false);
+});
+
+function visibilitySurface(kind) {
+  const target = { events: [], visible: true,
+    webview: { postMessage: msg => target.events.push(msg),
+      onDidReceiveMessage: callback => { target.send = callback; return { dispose() {} }; } },
+    onDidDispose: callback => { target.dispose = callback; return { dispose() {} }; },
+    [kind === "view" ? "onDidChangeVisibility" : "onDidChangeViewState"]: callback => {
+      target.setVisible = visible => { target.visible = visible; callback({ webviewPanel: target }); };
+      return { dispose() {} };
+    },
+  };
+  return target;
+}
+
+test("sidebar reveal requests from a replaced or disposed view cannot read card storage", async () => {
+  const h = setup(); h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.p.renderHtml = () => "";
+  const makeView = () => {
+    const view = visibilitySurface("view");
+    h.p.resolveWebviewView(view);
+    return view;
+  };
+  const first = makeView(), next = makeView(), request = h.revealRequest({ chatId: undefined });
+  await first.send(request); first.dispose?.();
+  assert.deepEqual(h.reads, []);
+  await next.send(request); assert.ok(next.events[0]?.values); assert.deepEqual(first.events, []);
+  next.dispose?.(); await next.send(request); assert.equal(h.reads.length, 1); assert.equal(next.events.length, 1);
+});
+
+test("retained local webviews remask on hide and reshow, suppress delayed reveals and allow a fresh request", async () => {
+  for (const kind of ["view", "panel", "multi-panel"]) {
+    const h = setup(), messages = localSurfaces(h), target = visibilitySurface(kind);
+    h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    h.p.renderHtml = () => ""; h.p.compactModeController = () => ({ attach() {} });
+    if (kind === "view") h.p.resolveWebviewView(target);
+    else if (kind === "panel") { h.p.panel = null; h.createPanel = () => target; await h.p.openFullView(); }
+    else h.p.attachMultiChatPanel(target);
+    const request = h.revealRequest({ chatId: kind === "multi-panel" ? h.slots[0].chatId : undefined });
+    const entered = gate(), release = gate();
+    h.beforeGet = async () => { entered.resolve(); await release.promise; };
+    const pending = target.send(request); await entered.promise;
+    assert.equal(typeof target.setVisible, "function");
+    target.setVisible(true); assert.deepEqual(target.events, []);
+    target.setVisible(false);
+    await target.send({ ...request, requestId: "hidden" });
+    target.setVisible(true); target.setVisible(true);
+    release.resolve(); await pending;
+    assert.deepEqual(target.events, [{ type: "hideProjectAccessValues" }, { type: "hideProjectAccessValues" }]);
+    assert.deepEqual(Object.values(messages).flat(), []); assert.equal(h.reads.length, 1);
+    await target.send({ ...request, requestId: "fresh" }); assert.ok(target.events.at(-1).values);
+  }
+});
+
+test("durable card changes announce only the project revision to all local surfaces before live-agent publication", async () => {
+  for (const type of ["saveProjectAccess", "deleteProjectAccess"]) {
+    const h = setup(), messages = localSurfaces(h), entered = gate(), release = gate();
+    h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+    h.p.publishLiveAccess = async () => { entered.resolve(); await release.promise; return false; };
+    const pending = h.send({ ...h.request({ expectedRevision: 1 }), type, id });
+    await entered.promise;
+    const expected = [{ type: "projectAccessRevisionChanged", projectPath: h.projects[0].id, revision: 2 }];
+    for (const surface of ["view", "panel", "multi-panel"]) assert.deepEqual(messages[surface], expected);
+    assert.deepEqual(messages.remote, []);
+    release.resolve(); await pending;
+    assert.ok(messages["multi-panel"].at(-1).error);
+  }
+});
+
+test("a failed card write never announces a revision and incidental surfaces cannot delay a committed write acknowledgement", async () => {
+  const h = setup(), messages = localSurfaces(h), release = gate();
+  h.beforeStore = () => { throw new Error("fixture"); };
+  await h.send(h.request());
+  assert.deepEqual(messages.view, []); assert.deepEqual(messages.panel, []);
+  assert.ok(messages["multi-panel"].at(-1).error);
+  h.beforeStore = undefined;
+  h.p.view.webview.postMessage = () => { throw new Error("disposed"); };
+  h.p.panel.webview.postMessage = () => release.promise;
+  const pending = h.send(h.request());
+  await tick();
+  const response = messages["multi-panel"].at(-1);
+  release.resolve(false); await pending;
+  assert.equal(response.type, "projectAccesses"); assert.equal(response.revision, 1); assert.equal(response.error, undefined);
+  assert.deepEqual(messages.remote, []);
+});
+
+test("a stalled reveal delivery leaves the storage queue available for a second project's save", async () => {
+  const h = setup(), entered = gate(), release = gate();
+  h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.p.view = { webview: { postMessage: () => { entered.resolve(); return release.promise; } } };
+  const reveal = h.send(h.revealRequest({ chatId: undefined }), "view");
+  await entered.promise;
+  const save = h.send(h.request({ projectPath: h.projects[1].id, chatId: h.slots[1].chatId }));
+  await tick();
+  const savedDuringDelivery = h.secrets.has(cardsKey(h.projects[1].id));
+  release.resolve(true); await Promise.all([save, reveal]);
+  assert.equal(savedDuringDelivery, true);
+});
+
+test("a closed recipient's failed delivery cannot reroute its reply or prevent a later reveal", async () => {
+  const h = setup(), messages = localSurfaces(h), panel = h.p.panel;
+  h.secrets.set(cardsKey(h.projects[0].id), connectionStore());
+  h.p.panel = { webview: { postMessage: async () => { throw new Error("closed"); } } };
+  await h.send(h.revealRequest({ chatId: undefined }), "panel");
+  assert.deepEqual([...h.messages, ...Object.values(messages).flat()], []);
+  h.p.panel = panel;
+  await h.send(h.revealRequest({ chatId: undefined }), "panel");
+  assert.ok(messages.panel[0]?.values);
+});
+
+test("generic host broadcasts cannot forward a reveal reply to any surface", () => {
+  const h = setup(), messages = localSurfaces(h);
+  const event = { type: "projectAccessRevealed", projectPath: h.projects[0].id, id,
+    requestId: "reveal-1", revision: 1, values: { password: "fixture" } };
+  h.p.post = ChatViewProvider.prototype.post.bind(h.p);
+  h.p.post(event);
+  h.p.postScoped(event.projectPath, event, h.slots[0].chatId);
+  assert.deepEqual(Object.values(messages).flat(), []);
+});
 
 test("card probe uses only selected-card credentials, leaves storage unchanged, and redacts diagnostics", async () => {
   const h = setup(), raw = connectionStore(); h.secrets.set(cardsKey(h.projects[0].id), raw);

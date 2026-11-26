@@ -25,8 +25,8 @@ import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
 import { isImageAttachment, prefixedAttachmentName } from "./shared/attachments";
-import { deleteProjectAccess, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, resolveProjectAccessConnection, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
-import type { ProjectAccessProtocol, ProjectAccessSummary } from "./shared/projectAccesses";
+import { deleteProjectAccess, isProjectAccessId, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, resolveProjectAccessConnection, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
+import type { ProjectAccessField, ProjectAccessProtocol, ProjectAccessSummary } from "./shared/projectAccesses";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
 import { applyActiveProjectOrder, moveInProjectOrder, reconcileProjectOrder } from "./shared/projectOrder";
 import { ApiProviderProfileStore, type ApiProviderProfile } from "./apiProviderProfiles";
@@ -89,10 +89,24 @@ const VSCODE_ONLY_ACTIONS = new Set<string>([
   "pickAttachment",
   "sendSecretEnv",
   "getProjectAccesses",
+  "revealProjectAccess",
   "saveProjectAccess",
   "deleteProjectAccess",
   "testProjectAccess",
 ]);
+
+type LocalAccessSurface = vscode.WebviewView | vscode.WebviewPanel;
+type AccessInvalidation = Extract<HostToWebview, { type: "projectAccessRevisionChanged" | "hideProjectAccessValues" }>;
+
+function directAccessEvent(msg: HostToWebview): boolean {
+  return msg.type === "projectAccessRevealed" || msg.type === "projectAccessRevisionChanged" || msg.type === "hideProjectAccessValues";
+}
+
+function projectAccessAddress(msg: { projectPath: string; requestId: string; chatId?: string }) {
+  const valid = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !value.includes("\0");
+  return { projectPath: valid(msg.projectPath, 4096) ? msg.projectPath : "",
+    requestId: valid(msg.requestId, 160) ? msg.requestId : "", ...(valid(msg.chatId, 160) ? { chatId: msg.chatId } : {}) };
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
@@ -494,6 +508,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postScoped(path: string, msg: HostToWebview, chatId?: string) {
+    if (directAccessEvent(msg)) return;
     const event = { ...msg, path, ...(chatId ? { chatId } : {}) } as HostToWebview;
     if (chatId) this.multiPanel?.webview.postMessage(event);
     else this.post(event);
@@ -528,9 +543,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "dist")],
     };
     view.webview.html = this.renderHtml(view.webview, "view");
-    view.webview.onDidReceiveMessage((msg: WebviewToHost) =>
-      this.onMessage(msg, "vscode", undefined, "view"),
+    const messages = view.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+      this.view === view ? this.onMessage(msg, "vscode", undefined, "view") : undefined,
     );
+    const visibility = this.watchAccessVisibility(view);
+    view.onDidDispose(() => {
+      messages.dispose();
+      visibility.dispose();
+      if (this.view === view) this.view = undefined;
+    });
   }
 
   // ---------- Проекты ----------
@@ -958,10 +979,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async handleProjectAccessMessage(
     msg: Extract<WebviewToHost, { type: "getProjectAccesses" | "saveProjectAccess" | "deleteProjectAccess" }>, surface?: string,
   ): Promise<void> {
-    const validString = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !value.includes("\0");
-    const projectPath = validString(msg.projectPath, 4096) ? msg.projectPath : "";
-    const requestId = validString(msg.requestId, 160) ? msg.requestId : "";
-    const chatId = validString(msg.chatId, 160) ? msg.chatId : undefined;
+    const { projectPath, requestId, chatId } = projectAccessAddress(msg);
     const binding = this.projectAccessBinding(projectPath, msg.chatId, surface);
     const respond = (store?: ProjectAccessStore, error?: string) => {
       const message: HostToWebview = { type: "projectAccesses", projectPath, requestId,
@@ -988,6 +1006,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!stillBound()) throw new Error(failure);
         const next = msg.type === "saveProjectAccess" ? saveProjectAccess(store, msg.access, legacy) : deleteProjectAccess(store, msg.id);
         await this.context.secrets.store(projectAccessesKey(binding.key), JSON.stringify(next));
+        for (const target of [this.view, this.panel, this.multiPanel]) {
+          if (target) void this.postAccessInvalidation(target, { type: "projectAccessRevisionChanged", projectPath, revision: next.revision });
+        }
         const delivered = await this.publishLiveAccess(binding.key);
         // A view may switch while persistence is in flight. Its response retains the original address.
         respond(next, !delivered ? "Доступы сохранены, но не удалось обновить окружение работающих агентов. Повторите сохранение." : stillBound() ? undefined : failure);
@@ -997,16 +1018,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private accessVisibility?: WeakMap<LocalAccessSurface, symbol>;
+
+  private async postAccessInvalidation(target: LocalAccessSurface, event: AccessInvalidation): Promise<void> {
+    try { await target.webview.postMessage(event); }
+    catch { /* A local view may have closed before delivery. */ }
+  }
+
+  private watchAccessVisibility(target: LocalAccessSurface): vscode.Disposable {
+    let hidden = target.visible === false;
+    const onChange = () => {
+      const nowHidden = target.visible === false;
+      if (nowHidden === hidden) return;
+      hidden = nowHidden;
+      if (hidden) (this.accessVisibility ??= new WeakMap()).set(target, Symbol());
+      // A retained webview can miss messages while hidden. Repeat the reset on return.
+      void this.postAccessInvalidation(target, { type: "hideProjectAccessValues" });
+    };
+    return "onDidChangeVisibility" in target ? target.onDidChangeVisibility(onChange) : target.onDidChangeViewState(onChange);
+  }
+
+  /** Deliver credentials directly to the same local webview that requested them. */
+  private async revealProjectAccess(msg: Extract<WebviewToHost, { type: "revealProjectAccess" }>, surface?: "view" | "panel" | "multi-panel") {
+    if (!surface) return;
+    const currentTarget = () => surface === "multi-panel" ? this.multiPanel : surface === "panel" ? this.panel : this.view;
+    const target = currentTarget();
+    if (!target || target.visible === false) return;
+    const visibility = this.accessVisibility?.get(target);
+    const requestingViewVisible = () => currentTarget() === target && target.visible !== false && this.accessVisibility?.get(target) === visibility;
+    const address = projectAccessAddress(msg);
+    const id = isProjectAccessId(msg.id) ? msg.id : "";
+    const binding = this.projectAccessBinding(address.projectPath, msg.chatId, surface);
+    const stillBound = () => requestingViewVisible() && binding !== undefined &&
+      this.projectAccessBinding(address.projectPath, msg.chatId, surface)?.directory === binding.directory;
+    const error = "Не удалось показать сохранённые значения. Обновите карточки и повторите попытку.";
+    await this.serializeProjectAccessWrite(async () => {
+      let revision = 0;
+      let values: Partial<Record<ProjectAccessField, string>> | undefined;
+      try {
+        if (id && address.requestId && binding && Number.isSafeInteger(msg.expectedRevision) &&
+            msg.expectedRevision >= 0 && msg.expectedRevision < Number.MAX_SAFE_INTEGER && stillBound()) {
+          const store = parseProjectAccessStore(await this.context.secrets.get(projectAccessesKey(binding.key)));
+          revision = store.revision;
+          if (revision === msg.expectedRevision && stillBound()) values = store.entries.find(entry => entry.id === id)?.values;
+        }
+      } catch { /* Storage diagnostics may include credential values. */ }
+      if (!requestingViewVisible()) return;
+      // Start delivery under the revision check without holding the storage queue open for IPC.
+      const delivered = target.webview.postMessage({ type: "projectAccessRevealed", ...address, id, revision,
+        ...(values ? { values } : { error }) } satisfies HostToWebview);
+      return { delivered };
+    }).then(result => result?.delivered).catch(() => { /* The requesting webview may have closed during delivery. */ });
+  }
+
   private pendingProjectAccessTests?: Map<string, symbol>;
 
   /** Snapshot under the short storage queue; wait for the connection outside it. */
   private async testProjectAccess(msg: Extract<WebviewToHost, { type: "testProjectAccess" }>, surface?: string): Promise<void> {
-    const validString = (value: unknown, max: number): value is string => typeof value === "string" && value.length > 0 && value.length <= max && !value.includes("\0");
-    const projectPath = validString(msg.projectPath, 4096) ? msg.projectPath : "";
-    const requestId = validString(msg.requestId, 160) ? msg.requestId : "";
-    const chatId = validString(msg.chatId, 160) ? msg.chatId : undefined;
+    const { projectPath, requestId, chatId } = projectAccessAddress(msg);
     const protocol: ProjectAccessProtocol = ["ssh", "sftp", "ftp"].includes(msg.access?.protocol) ? msg.access.protocol : "ssh";
-    const id = typeof msg.access?.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(msg.access.id) ? msg.access.id : undefined;
+    const id = isProjectAccessId(msg.access?.id) ? msg.access.id : undefined;
     let revision = 0;
     const respond = (ok: boolean, message: string) => {
       const response: HostToWebview = { type: "projectAccessTestResult", projectPath, requestId, revision, protocol, ok, message,
@@ -2826,8 +2897,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const messages = panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
       this.multiPanel === panel ? this.onMessage(msg, "vscode", undefined, "multi-panel") : undefined,
     );
+    const visibility = this.watchAccessVisibility(panel);
     const disposed = panel.onDidDispose(() => {
       messages.dispose();
+      visibility.dispose();
       disposed.dispose();
       if (this.multiPanel === panel) {
         this.multiPanel = null;
@@ -4913,6 +4986,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private post(msg: HostToWebview) {
+    if (directAccessEvent(msg)) return;
     this.view?.webview.postMessage(msg);
     this.panel?.webview.postMessage(msg);
     const chatEvents = new Set([
@@ -4959,11 +5033,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
     panel.webview.html = this.renderHtml(panel.webview, "panel");
-    panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
-      this.onMessage(msg, "vscode", undefined, "panel"),
+    const messages = panel.webview.onDidReceiveMessage((msg: WebviewToHost) =>
+      this.panel === panel ? this.onMessage(msg, "vscode", undefined, "panel") : undefined,
     );
+    const visibility = this.watchAccessVisibility(panel);
     panel.onDidDispose(() => {
-      this.panel = null;
+      messages.dispose();
+      visibility.dispose();
+      if (this.panel === panel) this.panel = null;
     });
     this.panel = panel;
     // Сайдбар прячем — чат занимает всю ширину окна.
@@ -5014,6 +5091,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if ((msg.type === "send" || msg.type === "steer") && (source === "remote" || surface !== undefined) &&
         (surface === "multi-panel" ? !msg.chatId : !!msg.chatId)) return;
     switch (msg.type) {
+      case "revealProjectAccess":
+        await this.revealProjectAccess(msg, surface);
+        break;
       case "testProjectAccess":
         await this.testProjectAccess(msg, surface);
         break;

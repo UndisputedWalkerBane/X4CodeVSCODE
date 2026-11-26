@@ -4,7 +4,9 @@ import type { ProjectAccessConnectionField, ProjectAccessConnectionInput, Projec
 
 export type ProjectAccessSnapshot = Extract<HostToWebview, { type: "projectAccesses" }>;
 export type ProjectAccessTestResult = Extract<HostToWebview, { type: "projectAccessTestResult" }>;
-type AccessRequest = Extract<WebviewToHost, { type: "getProjectAccesses" | "saveProjectAccess" | "deleteProjectAccess" | "testProjectAccess" }>;
+type AccessRequest = Extract<WebviewToHost, { type: "getProjectAccesses" | "saveProjectAccess" | "deleteProjectAccess" | "testProjectAccess" | "revealProjectAccess" }>;
+type RevealRequest = Extract<AccessRequest, { type: "revealProjectAccess" }>;
+type RevealedCard = { id: string; values?: Partial<Record<ProjectAccessField, string>> };
 type Draft = { id?: string; name: string; purpose: string; protocol?: ProjectAccessProtocol; port: string; portInvalid?: boolean; repository: string; values: Record<ProjectAccessField, string>; clearFields: ProjectAccessField[] };
 type Pending = { requestId: string; kind: "load" | "refresh" | "save" | "delete" };
 type InFlight = { requestId: string; projectPath: string; chatId?: string; id?: string; protocol: ProjectAccessProtocol; revision: number };
@@ -28,16 +30,18 @@ const repositoryHref = (repository: string): string | undefined => {
   catch { return undefined; }
 };
 
-/** Only metadata enters this editor; new values live in its local, keyed React state. */
-export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = null, onPost }: {
+/** Drafts and explicitly revealed credentials stay in this mounted settings component. */
+export function ProjectAccesses({ projectPath, chatId, visible = true, snapshot, testResult = null, onPost }: {
   projectPath: string;
   chatId?: string;
+  visible?: boolean;
   snapshot: ProjectAccessSnapshot | null;
   testResult?: ProjectAccessTestResult | null;
   onPost: (request: AccessRequest) => void;
 }) {
   const [entries, setEntries] = useState<ProjectAccessSummary[]>([]);
   const [revision, setRevision] = useState(0);
+  const [notifiedRevision, setNotifiedRevision] = useState(0);
   const revisionRef = useRef(0);
   const [loaded, setLoaded] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
@@ -59,8 +63,12 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const needsRefreshRef = useRef(false);
   const invalidateProbe = () => { probeRef.current = null; setProbe(null); };
+  const [revealed, setRevealed] = useState<RevealedCard | null>(null);
+  const pendingReveal = useRef<RevealRequest | null>(null);
+  const hideValues = () => { pendingReveal.current = null; setRevealed(null); };
 
   const begin = (kind: Pending["kind"]): string => {
+    hideValues();
     invalidateProbe();
     const next = { kind, requestId: requestId() };
     pendingRef.current = next;
@@ -73,6 +81,58 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
     if (pendingRef.current) return;
     postRef.current({ type: "getProjectAccesses", projectPath, requestId: begin(needsRefreshRef.current ? "refresh" : "load") });
   };
+  const refreshMetadata = () => {
+    needsRefreshRef.current = true;
+    setNeedsRefresh(true);
+    load();
+  };
+  const refreshAfterConflict = (message: string) => {
+    refreshMetadata();
+    setError(message);
+  };
+
+  useEffect(() => {
+    hideValues();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") hideValues();
+    };
+    const onMessage = (event: MessageEvent<HostToWebview>) => {
+      const msg = event.data;
+      if (event.origin !== window.origin || !msg) return;
+      if (msg.type === "hideProjectAccessValues") {
+        hideValues();
+        return;
+      }
+      if (msg.type === "projectAccessRevisionChanged") {
+        if (msg.projectPath === projectPath && msg.revision > revisionRef.current) {
+          hideValues();
+          setNotifiedRevision(current => Math.max(current, msg.revision));
+        }
+        return;
+      }
+      const request = pendingReveal.current;
+      if (!visible || !request || msg.type !== "projectAccessRevealed" ||
+          msg.projectPath !== request.projectPath || msg.chatId !== request.chatId || msg.requestId !== request.requestId ||
+          msg.id !== request.id || revisionRef.current !== request.expectedRevision) return;
+      if (globalThis.document?.visibilityState === "hidden") { hideValues(); return; }
+      if (typeof msg.error === "string") {
+        hideValues();
+        if (msg.revision > request.expectedRevision) refreshAfterConflict(msg.error);
+        else setError(msg.error);
+        return;
+      }
+      if (msg.revision !== request.expectedRevision || !msg.values) return;
+      pendingReveal.current = null;
+      setRevealed({ id: request.id, values: msg.values });
+    };
+    window.addEventListener("message", onMessage);
+    globalThis.document?.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      pendingReveal.current = null;
+      window.removeEventListener("message", onMessage);
+      globalThis.document?.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [projectPath, chatId, visible]);
 
   useEffect(() => {
     invalidateProbe();
@@ -84,6 +144,7 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
     pendingRef.current = null;
     revisionRef.current = 0;
     setRevision(0);
+    setNotifiedRevision(0);
     setEntries([]);
     setLoaded(false);
     setDraft(null);
@@ -97,7 +158,7 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
 
   useEffect(() => {
     if (!snapshot || snapshot.projectPath !== projectPath || snapshot.chatId !== chatId) return;
-    if (snapshot.revision > revisionRef.current) invalidateProbe();
+    if (snapshot.revision > revisionRef.current) { invalidateProbe(); hideValues(); }
     const current = pendingRef.current;
     if (!current || snapshot.requestId !== current.requestId) return;
     const olderRevision = snapshot.revision < revisionRef.current;
@@ -130,10 +191,7 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
     inFlightRef.current = null;
     setInFlight(null);
     if (!testResult.ok && testResult.revision > revisionRef.current) {
-      needsRefreshRef.current = true;
-      setNeedsRefresh(true);
-      load();
-      setError(testResult.message);
+      refreshAfterConflict(testResult.message);
       return;
     }
     const visible = probeRef.current;
@@ -163,6 +221,10 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
 
   const editing = !!draft;
   const editingId = draft?.id;
+  const metadataBehind = notifiedRevision > revision;
+  useEffect(() => {
+    if (visible && loaded && metadataBehind && !editing && !pending && !inFlight && !needsRefresh) refreshMetadata();
+  }, [visible, loaded, notifiedRevision, revision, editing, pending, inFlight, needsRefresh]);
   useEffect(() => { if (editing) nameRef.current?.focus(); }, [editing, editingId]);
   useEffect(() => {
     if (!editing && !pending && loaded && restoreAddFocusRef.current) {
@@ -180,6 +242,15 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
     (!!savedEntry?.hasValues[field] && !draft.clearFields.includes(field)));
   const checkValidation = !draft ? undefined : portError || (!hasConnectionField("url") || !hasConnectionField("login") ? "Для проверки укажите адрес и логин этого доступа." : undefined);
   const busy = !!pending;
+  const toggleValues = (entryId: string) => {
+    if (revealed?.id === entryId) { hideValues(); return; }
+    if (!visible || !loaded || pendingRef.current || draft || metadataBehind || needsRefreshRef.current || globalThis.document?.visibilityState === "hidden") return;
+    const request: RevealRequest = { type: "revealProjectAccess", projectPath, ...(chatId ? { chatId } : {}), id: entryId, requestId: requestId(), expectedRevision: revision };
+    pendingReveal.current = request;
+    setRevealed({ id: entryId });
+    setError(undefined);
+    postRef.current(request);
+  };
   const cancel = () => {
     if (pendingRef.current) return;
     setDraft(null);
@@ -190,6 +261,7 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
   };
   const open = (entry?: ProjectAccessSummary) => {
     if (!loaded || pendingRef.current || draft) return;
+    hideValues();
     invalidateProbe();
     setDraft({ ...(entry ? { id: entry.id } : {}), name: entry?.name ?? "", purpose: entry?.purpose ?? "", protocol: entry?.protocol,
       port: entry?.port === undefined ? "" : String(entry.port), repository: entry?.repository ?? "", values: emptyValues(), clearFields: [] });
@@ -243,15 +315,20 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
         <h4 id={`${id}-title`}>Дополнительные доступы</h4>
         <button ref={addRef} type="button" className="finish-btn" disabled={!loaded || busy || editing} onClick={() => open()}>Добавить доступ</button>
       </div>
-      <p className="project-accesses-hint">Отдельная карточка для каждого сервиса. Сохранённые значения не показываются; агент получает их через переменные окружения.</p>
+      <p className="project-accesses-hint">Сохранённые значения скрыты. Агент получает их через переменные окружения.</p>
       {!busy && (needsRefresh || (!loaded && error)) && <button type="button" className="finish-btn project-accesses-retry" onClick={load}>Повторить загрузку</button>}
       {loaded && entries.length === 0 && <p className="project-accesses-hint">Доступов пока нет.</p>}
       <div className="project-accesses-list">
-        {entries.map(entry => (
-          <article className="project-access-card" key={entry.id} aria-labelledby={`${id}-${entry.id}`}>
+        {entries.map(entry => {
+          const selected = visible && revealed?.id === entry.id;
+          const toggleLabel = selected ? "Скрыть" : "Показать";
+          return <article className="project-access-card" key={entry.id} aria-labelledby={`${id}-${entry.id}`}>
             <div className="project-accesses-heading">
               <h5 id={`${id}-${entry.id}`}>{entry.name}</h5>
               <div className="project-accesses-actions">
+                <button type="button" className="finish-btn" aria-label={`${toggleLabel} данные: ${entry.name}`}
+                  aria-expanded={selected} aria-controls={`${id}-values-${entry.id}`} disabled={busy || editing || needsRefresh || metadataBehind}
+                  onClick={() => toggleValues(entry.id)}>{toggleLabel}</button>
                 <button type="button" className="finish-btn" aria-label={`Проверить доступ ${entry.name}`} disabled={busy || editing || !!inFlight || needsRefresh || !entry.hasValues.url || !entry.hasValues.login}
                   onClick={() => testConnection(savedConnection(entry), "saved", entry.hasValues.url && entry.hasValues.login)}>Проверить доступ</button>
                 <button type="button" className="finish-btn" aria-label={`Изменить ${entry.name}`} disabled={busy || editing} onClick={() => open(entry)}>Изменить</button>
@@ -266,8 +343,11 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
             {entry.repository && <div className="project-access-repository"><span>Репозиторий: </span>{repositoryHref(entry.repository)
               ? <a href={repositoryHref(entry.repository)} target="_blank" rel="noopener noreferrer">{entry.repository}</a>
               : <code>{entry.repository}</code>}</div>}
-            <dl className="project-access-values">{FIELDS.map(field => (
-              <div key={field}><dt>{LABELS[field]}</dt><dd>{entry.hasValues[field] ? "задано" : "не задано"}</dd></div>
+            {selected && !revealed.values && <p className="project-accesses-hint" role="status">Загружаю значения…</p>}
+            <dl id={`${id}-values-${entry.id}`} className="project-access-values">{FIELDS.map(field => (
+              <div key={field}><dt>{LABELS[field]}</dt><dd>{selected && typeof revealed.values?.[field] === "string"
+                ? <code className="project-access-secret">{revealed.values[field]}</code>
+                : entry.hasValues[field] ? "задано" : "не задано"}</dd></div>
             ))}</dl>
             <details className="project-access-env">
               <summary>Переменные для агента</summary>
@@ -275,8 +355,8 @@ export function ProjectAccesses({ projectPath, chatId, snapshot, testResult = nu
                 <div key={field}><dt>{LABELS[field]}</dt><dd><code>{entry.envNames[field]}</code></dd></div>
               ))}</dl>
             </details>
-          </article>
-        ))}
+          </article>;
+        })}
       </div>
       {draft && (
         <div className="project-access-editor" role="group" aria-labelledby={`${id}-editor`} onKeyDown={event => {

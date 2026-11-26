@@ -57,7 +57,7 @@ const CHAT_COMMAND_TYPES = new Set([
   "selectChatProject", "selectChatSession", "selectChatAgent", "selectApiProvider", "apiModelSettings", "applyApiModelSetting",
   "pickAttachment", "saveAttachment",
   "manageSecretEnv", "sendSecretEnv", "manageProjects", "getSettings", "saveSettings", "saveTaskState",
-  "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess", "testProjectAccess",
+  "getProjectAccesses", "saveProjectAccess", "deleteProjectAccess", "testProjectAccess", "revealProjectAccess",
   "prepareMessageEdit", "editMessage",
 ]);
 const CHAT_EVENT_TYPES = new Set([
@@ -307,6 +307,7 @@ const NO_MODELS: Record<AgentId, { model: string; fallbackFrom?: string }> = {
 };
 
 function ChatTile({
+  boardArchiveOpen = false,
   chatId,
   initialProjectPath,
   initialRecordId,
@@ -316,6 +317,7 @@ function ChatTile({
   initialApiProfileModel,
   initialApiProfileEffort,
 }: {
+  boardArchiveOpen?: boolean;
   chatId?: string;
   initialProjectPath?: string;
   initialRecordId?: string;
@@ -2039,9 +2041,10 @@ function ChatTile({
                     и промпт попадают лишь имена переменных.
                   </div>
                   {!REMOTE && <ProjectAccesses
-                    key={JSON.stringify([chatId, projectKey(form.project)])}
+                    key={JSON.stringify([chatId, activePath, projectKey(form.project)])}
                     projectPath={projectKey(form.project)}
                     chatId={chatId}
+                    visible={!boardArchiveOpen}
                     snapshot={projectAccessSnapshot}
                     testResult={projectAccessTestResult}
                     onPost={post}
@@ -3431,6 +3434,7 @@ function MultiChatBoard() {
                       </button>
                     </div>
                   ) : <ChatTile
+                    boardArchiveOpen={archiveOpen}
                     key={slot.chatId}
                     chatId={slot.chatId}
                     initialProjectPath={slot.projectPath}

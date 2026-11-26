@@ -5,7 +5,7 @@
 
 import type { AgentDefaults } from "./agentDefaults";
 import type { TaskFields, TaskIdentity, TaskState } from "./taskState";
-import type { ProjectAccessConnectionInput, ProjectAccessInput, ProjectAccessProtocol, ProjectAccessSummary } from "./projectAccesses";
+import type { ProjectAccessConnectionInput, ProjectAccessField, ProjectAccessInput, ProjectAccessProtocol, ProjectAccessSummary } from "./projectAccesses";
 
 /** Какие агенты доступны в переключателе. */
 export type AgentId = "claude" | "codex";
@@ -177,6 +177,7 @@ export type WebviewToHost =
   | { type: "openFullView" }
   | { type: "getSettings"; chatId?: string }
   | { type: "getProjectAccesses"; projectPath: string; requestId: string; chatId?: string }
+  | { type: "revealProjectAccess"; projectPath: string; requestId: string; expectedRevision: number; id: string; chatId?: string }
   | { type: "saveProjectAccess"; projectPath: string; requestId: string; expectedRevision: number; access: ProjectAccessInput; chatId?: string }
   | { type: "deleteProjectAccess"; projectPath: string; requestId: string; expectedRevision: number; id: string; chatId?: string }
   | { type: "testProjectAccess"; projectPath: string; requestId: string; expectedRevision: number; access: ProjectAccessConnectionInput; chatId?: string }
@@ -293,6 +294,10 @@ export type HostToWebview =
   | { type: "slashCommands"; agent: AgentId; commands: SlashCommandInfo[] }
   | { type: "settings"; settings: SettingsSnapshot; chatId?: string }
   | { type: "projectAccesses"; projectPath: string; requestId: string; revision: number; entries: ProjectAccessSummary[]; error?: string; chatId?: string }
+  | { type: "projectAccessRevisionChanged"; projectPath: string; revision: number }
+  | { type: "hideProjectAccessValues" }
+  | ({ type: "projectAccessRevealed"; projectPath: string; requestId: string; revision: number; id: string; chatId?: string }
+    & ({ values: Partial<Record<ProjectAccessField, string>>; error?: never } | { error: string; values?: never }))
   | { type: "projectAccessTestResult"; projectPath: string; requestId: string; revision: number; id?: string; protocol: ProjectAccessProtocol; ok: boolean; message: string; chatId?: string }
   | { type: "safetyInfo"; agent: AgentId; label: string; dangerous: boolean }
   | { type: "effortInfo"; agent: AgentId; effort: string; path?: string; chatId?: string; recordId?: string }
