@@ -155,7 +155,7 @@ export type WebviewToHost =
     }
   | { type: "prepareMessageEdit"; requestId: string; recordId: string; messageId: string; path?: string; chatId?: string }
   | { type: "editMessage"; requestId: string; recordId: string; messageId: string; text: string; attachments: Attachment[]; path?: string; chatId?: string }
-  | { type: "pickAttachment"; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
+  | { type: "pickAttachment"; asPaths?: boolean; pathNames?: string[]; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
   | {
       /** path — проект ленты, в чью папку сохранить (не «активный» хоста). */
       type: "saveAttachment";
@@ -317,7 +317,7 @@ export type HostToWebview =
     }
   | { type: "messageEditPrepared"; requestId: string; sourceRecordId: string; messageId: string; agent?: AgentId; text?: string; attachments?: Attachment[]; missingAttachments?: string[]; error?: string; path?: string; chatId?: string }
   | { type: "editMessageResult"; requestId: string; ok: boolean; sourceRecordId: string; recordId?: string; error?: string; path?: string; chatId?: string }
-  | { type: "attachmentAdded"; files: Attachment[]; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
+  | { type: "attachmentAdded"; files: Attachment[]; textPaths?: string[]; path?: string; chatId?: string; draftContext?: AttachmentDraftContext }
   | { type: "serverTestResult"; projectPath: string; requestId: string; ok: boolean; message: string }
   | { type: "configJson"; json: string; chatId?: string }
   | { type: "configJsonResult"; ok: boolean; message: string }

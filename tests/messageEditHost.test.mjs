@@ -681,6 +681,55 @@ test("steering echoes identify their record and explicitly disable native prompt
   const echo = h.messages.find(m => m.type === "userMessage"); assert.equal(echo?.recordId, "record-1"); assert.equal(echo.sentMessage?.kind, "steer"); assert.ok(echo.sentMessage.editUnavailableReason);
 });
 
+for (const timing of ["while the turn is running", "after the turn has finished"]) {
+  test(`steering rejected ${timing} retries with the path text and the prepared small attachment`, async () => {
+    const h = await editSetup();
+    const path = h.projects[0].id, chatId = h.slots[0].chatId;
+    const ready = gate(), inSteer = gate(), finish = gate(), rejectSteer = gate(), retryFinished = gate();
+    delete h.p.relocateAttachments;
+    h.projects[1].path = join(temp, "other-project");
+    const original = { name: "small.txt", path: join(h.projects[1].path, ".agent-hub", "attachments", "small.txt") };
+    await mkdir(dirname(original.path), { recursive: true });
+    await writeFile(original.path, "small attachment");
+    const calls = [];
+    const post = h.p.multiPanel.webview.postMessage;
+    h.p.multiPanel.webview.postMessage = message => {
+      post(message);
+      if (calls.length === 2 && message.type === "busy" && !message.value) retryFinished.resolve();
+    };
+    h.p.backends.codex.start = async function* (prompt, opts) {
+      calls.push({ prompt, attachments: opts.attachments });
+      if (calls.length === 1) {
+        opts.steer.handler = async () => { inSteer.resolve(); await rejectSteer.promise; throw new Error("Ход уже завершён"); };
+        ready.resolve();
+        await finish.promise;
+      }
+      yield { kind: "assistantText", text: "Finished" };
+    };
+    const running = h.send({ type: "send", agent: "codex", text: "First turn", chatId, path });
+    await ready.promise;
+    const text = "Inspect both files.\nФайл: /fixture/большой архив.bin";
+    const steering = h.send({ type: "steer", agent: "codex", text, attachments: [original], mode: "next", chatId, path });
+    await inSteer.promise;
+    const firstEcho = h.messages.find(message => message.type === "userMessage" && message.text === text);
+    const [prepared] = firstEcho.sentMessage.attachmentFiles;
+    assert.notEqual(prepared.path, original.path);
+    assert.equal(await readFile(prepared.path, "utf8"), "small attachment");
+    if (timing === "after the turn has finished") {
+      finish.resolve();
+      await running;
+    }
+    rejectSteer.resolve();
+    await steering;
+    finish.resolve();
+    await running;
+    await retryFinished.promise;
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1].prompt.includes(text));
+    assert.deepEqual(calls[1].attachments, [{ path: prepared.path, isImage: false }]);
+  });
+}
+
 test("fresh native sessions receive every retained entry without the resumed-tail clipping limit", async () => {
   const h = await editSetup(); h.record().agentIds.claude = null;
   h.record().chatLog = Array.from({ length: 25 }, (_, i) => ({ agent: "claude", role: i % 2 ? "assistant" : "user", text: `retained-${i}:` + "x".repeat(5000) + `:end-${i}` }));
@@ -690,13 +739,99 @@ test("fresh native sessions receive every retained entry without the resumed-tai
 
 test("contextual attachment picking echoes the exact draft identity only while its binding is current", async () => {
   const h = await editSetup(); const draftContext = { draftId: "edit-draft-1", recordId: "record-1" };
-  h.pickOpenDialog = async () => [{ fsPath: h.file }];
+  h.pickOpenDialog = async () => [{ scheme: "file", fsPath: h.file }];
   await h.send({ type: "pickAttachment", chatId: h.slots[0].chatId, path: h.projects[0].id, draftContext });
   const added = h.messages.filter(m => m.type === "attachmentAdded").at(-1); assert.deepEqual(added.draftContext, draftContext); assert.equal(added.chatId, h.slots[0].chatId);
-  h.messages.length = 0; const entered = gate(), release = gate(); h.pickOpenDialog = async () => { entered.resolve(); await release.promise; return [{ fsPath: h.file }]; };
+  h.messages.length = 0; const entered = gate(), release = gate(); h.pickOpenDialog = async () => { entered.resolve(); await release.promise; return [{ scheme: "file", fsPath: h.file }]; };
   const picking = h.send({ type: "pickAttachment", chatId: h.slots[0].chatId, path: h.projects[0].id, draftContext }); await entered.promise;
   await h.send({ type: "newSession", chatId: h.slots[0].chatId }); release.resolve(); await picking;
   assert.equal(h.messages.some(m => m.type === "attachmentAdded"), false);
+});
+
+test("the desktop file picker returns text paths only above 20 MiB and only to its originating surface", async () => {
+  const h = await editSetup();
+  const boundary = join(temp, "exact-boundary.bin");
+  const oversized = join(temp, "проверка 📌.bin");
+  for (const [path, size] of [[boundary, 20 * 1024 * 1024], [oversized, 20 * 1024 * 1024 + 1]]) {
+    await writeFile(path, "");
+    await fsPromises.truncate(path, size);
+  }
+  const otherSurfaces = [];
+  delete h.p.post;
+  h.p.view = { webview: { postMessage: message => h.messages.push(message) } };
+  h.p.panel = h.p.multiPanel = { webview: { postMessage: message => otherSurfaces.push(message) } };
+  h.p.remote = { broadcast: message => otherSurfaces.push(message) };
+  h.pickOpenDialog = async () => [boundary, oversized].map(fsPath => ({ scheme: "file", fsPath }));
+  const path = h.projects[0].id;
+  const draftContext = { draftId: "ordinary-picker", recordId: "record-1" };
+  await h.send({ type: "pickAttachment", path, draftContext }, "view");
+  const added = h.messages.find(message => message.type === "attachmentAdded");
+  assert.deepEqual(added?.files, [{ name: "exact-boundary.bin", path: boundary }]);
+  assert.deepEqual(added.textPaths, [oversized]);
+  assert.deepEqual(added.draftContext, draftContext);
+  assert.equal(added.chatId, undefined);
+  assert.equal(added.path, path);
+  assert.equal(otherSurfaces.some(message => message.type === "attachmentAdded"), false);
+});
+
+test("the fallback picker returns text only, then acknowledges cancellation without modifying the draft", async () => {
+  const h = await editSetup();
+  const chatId = h.slots[0].chatId, path = h.projects[0].id;
+  const draftContext = { draftId: "edit-picker", recordId: "record-1", uploadId: "first-drop" };
+  const request = { type: "pickAttachment", asPaths: true, chatId, path, draftContext };
+  h.pickOpenDialog = async () => [{ scheme: "file", fsPath: h.file }];
+  await h.send(request);
+  const added = h.messages.find(message => message.type === "attachmentAdded");
+  assert.deepEqual(added?.files, []);
+  assert.deepEqual(added.textPaths, [h.file]);
+  assert.deepEqual(added.draftContext, draftContext);
+  assert.equal(added.chatId, chatId);
+
+  h.messages.length = 0;
+  h.pickOpenDialog = async () => undefined;
+  const canceledDraft = { ...draftContext, uploadId: "second-drop" };
+  await h.send({ ...request, draftContext: canceledDraft });
+  const canceled = h.messages.find(message => message.type === "attachmentAdded");
+  assert.deepEqual(canceled?.files, []);
+  assert.deepEqual(canceled.textPaths ?? [], []);
+  assert.deepEqual(canceled.draftContext, canceledDraft);
+  assert.equal(canceled.chatId, chatId);
+});
+
+test("a fallback picker rejection identifies the originating chat and pending upload", async () => {
+  const h = await editSetup();
+  const chatId = h.slots[0].chatId, path = h.projects[0].id;
+  const draftContext = { draftId: "fallback-error", recordId: "record-1", uploadId: "failed-pick" };
+  h.pickOpenDialog = async () => { throw new Error("Picker unavailable"); };
+  await h.send({ type: "pickAttachment", asPaths: true, chatId, path, draftContext });
+  const error = h.messages.find(message => message.type === "error");
+  assert.deepEqual(error?.draftContext, draftContext);
+  assert.equal(error.chatId, chatId);
+  assert.equal(error.path, path);
+  assert.match(error.message, /Picker unavailable/);
+});
+
+test("a virtual picker URI cannot be used as a reference to a local namesake", async () => {
+  const h = await editSetup();
+  h.pickOpenDialog = async () => [{ scheme: "git", fsPath: h.file }];
+  for (const asPaths of [true, false]) {
+    h.messages.length = 0;
+    await h.send({ type: "pickAttachment", asPaths, chatId: h.slots[0].chatId, path: h.projects[0].id });
+    assert.ok(h.messages.some(m => m.type === "error"));
+    assert.equal(h.messages.some(m => m.type === "attachmentAdded"), false);
+  }
+});
+
+test("reselecting a mixed drop only inserts paths for the requested missing names", async () => {
+  const h = await editSetup();
+  const known = join(temp, "already-added.bin");
+  const missing = join(temp, "only-missing.bin");
+  h.pickOpenDialog = async () => [known, missing].map(fsPath => ({ scheme: "file", fsPath }));
+  await h.send({ type: "pickAttachment", asPaths: true, pathNames: ["only-missing.bin"],
+    chatId: h.slots[0].chatId, path: h.projects[0].id });
+  const added = h.messages.find(m => m.type === "attachmentAdded");
+  assert.deepEqual(added?.files, []);
+  assert.deepEqual(added.textPaths, [missing]);
 });
 
 test("contextual upload rejects an old record and successful upload includes exact draft context", async () => {

@@ -38,6 +38,10 @@ await build({
 });
 const { App } = await import(pathToFileURL(outfile));
 const ChatTile = App().type;
+window.__AGENT_HUB_REMOTE__ = true;
+const { App: MobileApp } = await import(pathToFileURL(outfile).href + "?mobile");
+delete window.__AGENT_HUB_REMOTE__;
+const MobileChatTile = MobileApp().type;
 const project = { id: "project-one", name: "One", path: "/fixture/one" };
 const secondProject = { id: "project-two", name: "Two", path: "/fixture/two" };
 const oldImage = { name: "original.PNG", path: "/fixture/one/.agent-hub/attachments/original.PNG" };
@@ -48,7 +52,7 @@ const textOf = node => node == null || typeof node === "boolean" ? "" : Array.is
 function nodes(node) { return Array.isArray(node) ? node.flatMap(nodes) : node && typeof node === "object" ? [node, ...nodes(node.props?.children)] : []; }
 const harnesses = [];
 afterEach(() => { harnesses.splice(0).forEach(h => h.dispose()); commands = []; listeners.clear(); readers = []; });
-function harness(props = {}) {
+function harness(props = {}, Tile = ChatTile) {
   const slots = []; let cursor = 0, dirty = false, effects = [], cleanups = [], refs = new Map();
   const hooks = {
     state(initial) { const i = cursor++; if (!(i in slots)) slots[i] = typeof initial === "function" ? initial() : initial;
@@ -74,13 +78,20 @@ function harness(props = {}) {
     refs = next;
   };
   h.render = () => { for (let n = 0; n < 30; n++) { globalThis[hookKey] = hooks; cursor = 0; dirty = false; effects = []; cleanups = [];
-    h.tree = ChatTile(props); commitRefs(); cleanups.forEach(fn => fn()); effects.forEach(fn => fn()); if (!dirty) return; } assert.fail("render did not settle"); };
+    h.tree = Tile(props); commitRefs(); cleanups.forEach(fn => fn()); effects.forEach(fn => fn()); if (!dirty) return; } assert.fail("render did not settle"); };
   h.all = type => nodes(h.tree).filter(node => node.type === type);
   h.button = label => h.all("button").find(node => (node.props["aria-label"] ?? textOf(node).trim()) === label);
   h.click = label => { const button = h.button(label); assert.ok(button, `missing ${label}`); assert.equal(!!button.props.disabled, false, `${label} is disabled`);
     button.props.onClick({ currentTarget: button.props.ref?.current ?? { isConnected: true, focus() {} } }); h.render(); };
   h.field = label => nodes(h.tree).find(node => ["textarea", "input"].includes(node.type) && node.props["aria-label"] === label);
   h.edit = (label, value) => { const field = h.field(label); assert.ok(field, `missing ${label}`); field.props.onChange({ target: { value } }); h.render(); };
+  h.drop = (files, formats = {}) => {
+    const dataTransfer = { files, types: [...(files.length ? ["Files"] : []), ...Object.keys(formats)],
+      items: files.map(file => ({ kind: "file", type: file.type, getAsFile: () => file })),
+      getData: type => Object.entries(formats).find(([key]) => key.toLowerCase() === type.toLowerCase())?.[1] ?? "" };
+    h.all("footer").at(-1).props.onDrop({ dataTransfer, preventDefault() {}, stopPropagation() {} });
+    h.render();
+  };
   h.deliver = message => { [...listeners].forEach(listener => listener({ data: message })); h.render(); };
   h.event = message => h.deliver({ path: project.id, ...(props.chatId ? { chatId: props.chatId } : {}), ...message });
   h.pick = files => { h.click("Прикрепить файлы"); const request = commands.filter(command => command.type === "pickAttachment").at(-1); h.event({ type: "attachmentAdded", files, draftContext: request.draftContext }); };
@@ -208,6 +219,181 @@ test("ordinary pasted files also block sending until their upload completes or f
   h.field("Сообщение агенту").props.onPaste({ clipboardData: { files: [new File(["image"], "pasted.png")] }, preventDefault() {} }); h.render();
   assert.equal(h.button("Отправить").props.disabled, true); readers.at(-1).fail(); h.render();
   assert.equal(h.button("Отправить").props.disabled, false); assert.ok(nodes(h.tree).some(node => node.props?.role === "alert"));
+});
+
+const largePath = "/fixture/Документы/отчёт 2026.bin";
+const largeUri = "file://" + encodeURI(largePath);
+function largeFile(name = "отчёт 2026.bin") {
+  const file = new File([], name);
+  Object.defineProperty(file, "size", { value: 20 * 1024 * 1024 + 1 });
+  return file;
+}
+
+test("a mixed desktop drop inserts the decoded large file path and uploads only the small file", async () => {
+  const h = harness();
+  h.edit("Сообщение агенту", "Inspect these files");
+  const small = new File(["hello"], "small.txt");
+  h.drop([largeFile(), small], { "text/uri-list": largeUri + "\r\nfile:///fixture/small.txt" });
+  const text = h.field("Сообщение агенту").props.value;
+  assert.ok(text.startsWith("Inspect these files"));
+  assert.ok(text.includes(`Файл: ${largePath}`));
+  assert.equal(text.includes("small.txt"), false);
+  assert.deepEqual(readers.map(reader => reader.file), [small]);
+  const request = await h.resolve();
+  const attachment = { name: small.name, path: "/fixture/upload/small.txt" };
+  h.ack(request, [attachment]);
+  assert.deepEqual(h.chipNames(), [small.name]);
+  h.click("Отправить");
+  const sent = commands.find(command => command.type === "send");
+  assert.equal(sent.text, text);
+  assert.deepEqual(sent.attachments, [attachment]);
+});
+
+test("a partial FileList preserves extra URI entries and requests only the unresolved oversized files", async () => {
+  const h = harness();
+  const small = new File(["hello"], "small.txt");
+  const extraPath = "/fixture/URI-only.md";
+  h.drop([largeFile(), small, largeFile("archive.bin"), largeFile("other.bin")], {
+    CodeFiles: JSON.stringify([largePath, "/fixture/small.txt", extraPath]),
+  });
+  assert.deepEqual(readers.map(reader => reader.file), [small]);
+  assert.equal(h.field("Сообщение агенту").props.value, `Файл: ${largePath}\nФайл: ${extraPath}`);
+  const requests = commands.filter(command => command.type === "pickAttachment");
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].pathNames, ["archive.bin", "other.bin"]);
+  h.ack(requests[0], [], { textPaths: ["/fixture/archive.bin", "/fixture/other.bin"] });
+  const upload = await h.resolve();
+  h.ack(upload, [{ name: small.name, path: "/fixture/uploads/small.txt" }]);
+  assert.deepEqual(h.chipNames(), [small.name]);
+  assert.equal(h.field("Сообщение агенту").props.value,
+    [largePath, extraPath, "/fixture/archive.bin", "/fixture/other.bin"].map(path => `Файл: ${path}`).join("\n"));
+});
+
+test("VS Code CodeFiles paths enter the edit composer and leave the ordinary draft intact", () => {
+  const h = harness();
+  h.edit("Сообщение агенту", "Unsent ordinary message");
+  h.beginEdit();
+  h.drop([largeFile()], { CodeFiles: JSON.stringify([largePath]) });
+  const text = h.field("Редактируемое сообщение").props.value;
+  assert.ok(text.startsWith("Editable prompt"));
+  assert.ok(text.includes(`Файл: ${largePath}`));
+  assert.deepEqual(h.chipNames(), [oldImage.name]);
+  assert.equal(readers.length, 0);
+  assert.equal(commands.some(command => command.type === "pickAttachment"), false);
+  h.click("Отмена");
+  assert.equal(h.field("Сообщение агенту").props.value, "Unsent ordinary message");
+});
+
+test("a desktop URI-only drop inserts local file paths without a File object", () => {
+  const h = harness();
+  h.drop([], { "text/uri-list": "# local files\r\n" + largeUri + "\r\nhttps://example.org/ignore" });
+  assert.equal(h.field("Сообщение агенту").props.value.trim(), `Файл: ${largePath}`);
+  assert.deepEqual(h.chipNames(), []);
+  assert.equal(readers.length, 0);
+  assert.equal(commands.some(command => command.type === "pickAttachment"), false);
+});
+
+test("an Explorer URI list preserves every selected Windows path and ignores malformed or network URIs", () => {
+  const h = harness();
+  h.drop([], {
+    ResourceURLs: "invalid",
+    "application/vnd.code.uri-list": ["file:///C:/work/a%20b.tar", "file:///D:/data/x%23y.bin",
+      "file:///bad%2Fname.bin", "file://remote.invalid/share/a", "file:////remote.invalid/share/b",
+      "file:///%5Cremote.invalid/share/c"].join("\r\n"),
+    "text/uri-list": "file:///C:/work/a%20b.tar",
+  });
+  assert.equal(h.field("Сообщение агенту").props.value, "Файл: C:\\work\\a b.tar\nФайл: D:\\data\\x#y.bin");
+});
+
+test("two oversized files with the same basename require one picker when the drop exposes only one URI", () => {
+  const h = harness();
+  h.drop([largeFile(), largeFile()], { "text/uri-list": largeUri });
+  assert.equal(h.field("Сообщение агенту").props.value, "");
+  assert.equal(commands.filter(message => message.asPaths === true).length, 1);
+  assert.equal(readers.length, 0);
+});
+
+test("a partial FileList retains both selected paths when small files share a basename", () => {
+  const h = harness();
+  h.drop([new File(["small"], "same.txt")], { CodeFiles: JSON.stringify(["/one/same.txt", "/two/same.txt"]) });
+  assert.equal(h.field("Сообщение агенту").props.value, "Файл: /one/same.txt\nФайл: /two/same.txt");
+  assert.equal(readers.length, 1);
+});
+
+test("a desktop Files-only drop opens one path picker and appends the result to the current draft", () => {
+  const h = harness({ chatId: "chat-path", initialProjectPath: project.id, initialRecordId: "record-one", initialAgent: "codex" });
+  h.edit("Сообщение агенту", "Original draft");
+  h.drop([largeFile()]);
+  const requests = commands.filter(command => command.type === "pickAttachment");
+  assert.equal(requests.length, 1);
+  const [request] = requests;
+  assert.equal(request.asPaths, true);
+  assert.equal(request.path, project.id);
+  assert.equal(request.chatId, "chat-path");
+  assert.equal(request.draftContext.recordId, "record-one");
+  assert.ok(request.draftContext.draftId);
+  assert.ok(request.draftContext.uploadId);
+  assert.equal(readers.length, 0);
+  assert.equal(h.field("Сообщение агенту").props.value, "Original draft");
+  h.edit("Сообщение агенту", "Typed while picking");
+  h.ack(request, [], { textPaths: [largePath], draftContext: { ...request.draftContext, draftId: "other" } });
+  assert.equal(h.field("Сообщение агенту").props.value, "Typed while picking");
+  h.ack(request, [], { textPaths: [largePath] });
+  const text = h.field("Сообщение агенту").props.value;
+  assert.ok(text.startsWith("Typed while picking"));
+  assert.ok(text.includes(`Файл: ${largePath}`));
+  assert.deepEqual(h.chipNames(), []);
+});
+
+test("canceling the edit draft's large-file picker preserves both drafts and their attachments", () => {
+  const h = harness();
+  h.edit("Сообщение агенту", "Keep ordinary draft");
+  h.beginEdit();
+  h.drop([largeFile()]);
+  const request = commands.find(command => command.type === "pickAttachment");
+  assert.ok(request?.asPaths);
+  h.ack(request, []);
+  assert.equal(h.field("Редактируемое сообщение").props.value, "Editable prompt");
+  assert.deepEqual(h.chipNames(), [oldImage.name]);
+  assert.equal(h.button("Сохранить и отправить").props.disabled, false);
+  h.click("Отмена");
+  assert.equal(h.field("Сообщение агенту").props.value, "Keep ordinary draft");
+});
+
+test("a late picker reply for a canceled edit cannot insert paths into the ordinary draft", () => {
+  const h = harness();
+  h.edit("Сообщение агенту", "Ordinary draft");
+  h.beginEdit();
+  h.drop([largeFile()]);
+  const request = commands.find(command => command.type === "pickAttachment");
+  assert.ok(request?.draftContext.uploadId);
+  h.click("Отмена");
+  h.ack(request, [], { textPaths: [largePath] });
+  assert.equal(h.field("Сообщение агенту").props.value, "Ordinary draft");
+  assert.deepEqual(h.chipNames(), []);
+});
+
+test("a picker error unblocks sending while preserving the ordinary draft", () => {
+  const h = harness();
+  h.edit("Сообщение агенту", "Keep after picker failure");
+  h.drop([largeFile()]);
+  const request = commands.find(command => command.type === "pickAttachment");
+  assert.ok(request?.draftContext.uploadId);
+  assert.equal(h.button("Отправить").props.disabled, true);
+  h.event({ type: "error", message: "Picker unavailable", draftContext: request.draftContext });
+  assert.equal(h.button("Отправить").props.disabled, false);
+  assert.equal(h.field("Сообщение агенту").props.value, "Keep after picker failure");
+  assert.ok(nodes(h.tree).some(node => node.props?.role === "alert" && textOf(node).includes("Picker unavailable")));
+});
+
+test("the mobile composer keeps its upload size limit and never inserts a desktop path", () => {
+  const h = harness({}, MobileChatTile);
+  h.edit("Сообщение агенту", "Mobile draft");
+  h.drop([largeFile()], { "text/uri-list": largeUri });
+  assert.equal(h.field("Сообщение агенту").props.value, "Mobile draft");
+  assert.equal(readers.length, 0);
+  assert.equal(commands.some(command => command.type === "pickAttachment"), false);
+  assert.ok(nodes(h.tree).some(node => node.props?.role === "alert" && textOf(node).includes("20")));
 });
 
 for (const phase of ["read", "host"]) test(`project switches discard stale ${phase} completion and unblock the new draft`, async () => {

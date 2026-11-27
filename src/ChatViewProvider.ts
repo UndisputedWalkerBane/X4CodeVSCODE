@@ -24,7 +24,7 @@ import { CodexWriterRecoveryBackend } from "./agents/codexWriterRecovery";
 import { buildFinishPrompt, readJournalContext } from "./journal";
 import { buildServerEnvironment, formatSshCommand, testServerConnection } from "./serverConnection";
 import { isProjectId, projectKey } from "./shared/projectIdentity";
-import { isImageAttachment, prefixedAttachmentName } from "./shared/attachments";
+import { isImageAttachment, MAX_ATTACHMENT_BYTES, prefixedAttachmentName } from "./shared/attachments";
 import { deleteProjectAccess, isProjectAccessId, mergeProjectAccessEnvironment, parseProjectAccessStore, projectAccessesKey, resolveProjectAccessConnection, saveProjectAccess, summarizeProjectAccesses, type ProjectAccessStore } from "./projectAccesses";
 import type { ProjectAccessField, ProjectAccessProtocol, ProjectAccessSummary } from "./shared/projectAccesses";
 import { directoriesOverlap, executeProjectMove, normalizeProjectArchive, pathEntryExists, planProjectMove, type ProjectMovePlan } from "./projectArchive";
@@ -417,6 +417,7 @@ function matchesSendBinding(record: SessionRecord | null | undefined, binding: S
 
 interface DeferredTurn {
   binding?: SendBinding;
+  attachments?: Attachment[];
   prompt: string;
   agent: AgentId;
   chatId?: string;
@@ -5299,31 +5300,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             type: "info",
             text: `Докинуть в идущий ход не удалось (${err instanceof Error ? err.message : err}) — сообщение уйдёт после завершения хода.`,
           }, msg.chatId);
-          this.deferTurn(target, msg.agent, msg.text, undefined, msg.chatId, "steer", { recordId: record?.id, apiProfileId: record?.apiProfile?.id ?? null });
+          this.deferTurn(target, {
+            agent: msg.agent, prompt: msg.text, attachments: files, chatId: msg.chatId, messageKind: "steer",
+            binding: { recordId: record?.id, apiProfileId: record?.apiProfile?.id ?? null },
+          });
         }
         break;
       }
-      case "pickAttachment": {
-        const slot = this.findChatSlot(msg.chatId);
-        const target = slot?.projectPath ?? msg.path ?? this.getActiveProjectKey();
-        const binding = this.captureAttachmentBinding(msg.path, msg.chatId, msg.draftContext);
-        if (!binding) break;
-        const picked = await vscode.window.showOpenDialog({
-          canSelectFiles: true,
-          canSelectFolders: false,
-          canSelectMany: true,
-          openLabel: "Прикрепить",
-        });
-        if (picked?.length && this.attachmentBindingCurrent(binding, msg.chatId, msg.draftContext)) {
-          const event: HostToWebview = {
-            type: "attachmentAdded",
-            files: picked.map((u) => ({ name: nodePath.basename(u.fsPath), path: u.fsPath })),
-            ...(msg.draftContext ? { draftContext: msg.draftContext } : {}),
-          };
-          if (target) this.postScoped(target, event, msg.chatId);
-        }
+      case "pickAttachment":
+        await this.pickComposerFiles(msg, surface);
         break;
-      }
       case "saveAttachment":
         await this.saveAttachment(msg.name, msg.dataBase64, msg.path, msg.chatId, msg.draftContext);
         break;
@@ -5471,7 +5457,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Сохранить вставленный/перетащенный файл в <проект>/.agent-hub/attachments/. */
+  private async pickComposerFiles(msg: Extract<WebviewToHost, { type: "pickAttachment" }>, surface?: "view" | "panel" | "multi-panel") {
+    if (!surface || (surface === "multi-panel") !== Boolean(msg.chatId)) return;
+    const currentSurface = () => surface === "multi-panel" ? this.multiPanel : surface === "panel" ? this.panel : this.view;
+    const origin = currentSurface();
+    const binding = this.captureAttachmentBinding(msg.path, msg.chatId, msg.draftContext);
+    if (!origin || !binding) return;
+    const address = { path: binding.key, ...(msg.chatId && { chatId: msg.chatId }), draftContext: msg.draftContext };
+    let response: HostToWebview;
+    try {
+      const missing = msg.asPaths && Array.isArray(msg.pathNames)
+        ? new Set(msg.pathNames.filter((name): name is string => typeof name === "string").map(name => name.normalize("NFC"))) : undefined;
+      const hint = missing?.size ? [...missing].slice(0, 3).map(name => name.replace(/[\x00-\x1f]/g, " ")).join(", ").slice(0, 160) : "";
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: true, canSelectFolders: false, canSelectMany: true,
+        ...(msg.asPaths && { title: hint ? `Выберите файл для вставки пути — ${hint}` : "Выберите файлы для вставки пути" }),
+        openLabel: msg.asPaths ? "Вставить путь" : "Прикрепить",
+      });
+      const files: Attachment[] = [];
+      const textPaths: string[] = [];
+      for (const uri of picked ?? []) {
+        const extensionUri = this.context.extensionUri;
+        const sameRemoteHost = uri.scheme === "vscode-remote" && extensionUri?.scheme === uri.scheme && extensionUri.authority === uri.authority;
+        const nativeFile = uri.scheme === "file" && (!uri.authority || process.platform === "win32");
+        if ((!nativeFile && !sameRemoteHost) || !nodePath.isAbsolute(uri.fsPath)) {
+          throw new Error("Выберите файл на диске, доступном агенту.");
+        }
+        if (missing?.size && !missing.has(nodePath.basename(uri.fsPath).normalize("NFC"))) continue;
+        if (msg.asPaths || (await fs.promises.stat(uri.fsPath)).size > MAX_ATTACHMENT_BYTES) textPaths.push(uri.fsPath);
+        else files.push({ name: nodePath.basename(uri.fsPath), path: uri.fsPath });
+      }
+      if (picked?.length && missing?.size && !textPaths.length) throw new Error("Выберите перетащенный файл с указанным именем.");
+      response = { type: "attachmentAdded", ...address, files, ...(textPaths.length > 0 && { textPaths }) };
+    } catch (error) {
+      response = { type: "error", ...address, message: error instanceof Error
+        ? `Не удалось выбрать файл. ${error.message}` : "Не удалось выбрать файл. Повторите выбор." };
+    }
+    if (origin === currentSurface() && this.attachmentBindingCurrent(binding, msg.chatId, msg.draftContext)) {
+      await origin.webview.postMessage(response);
+    }
+  }
+
   private captureAttachmentBinding(projectPath?: string, chatId?: string, draftContext?: AttachmentDraftContext) {
     const slot = this.findChatSlot(chatId);
     if (chatId && !slot) return undefined;
@@ -5609,7 +5635,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ход после завершения текущего (или сразу, если проект свободен). */
-  private deferTurn(cwd: string, agent: AgentId, prompt: string, questionOrigin?: QuestionOrigin, chatId?: string, messageKind?: UserMessageKind, binding?: SendBinding) {
+  private deferTurn(cwd: string, turn: DeferredTurn) {
+    const { agent, questionOrigin, chatId } = turn;
     if (questionOrigin && !this.isQuestionOriginCurrent(cwd, agent, questionOrigin)) {
       this.reportExpiredQuestion(cwd, chatId);
       return false;
@@ -5617,12 +5644,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const runKey = chatId ?? cwd;
     if (this.runs.has(runKey)) {
       const list = this.deferred.get(runKey) ?? [];
-      list.push({ prompt, agent, chatId, questionOrigin, messageKind, binding });
+      list.push(turn);
       this.deferred.set(runKey, list);
       return true;
     }
-    void this.runTurn(prompt, agent, [], cwd, true, questionOrigin, chatId, false, messageKind, binding);
+    void this.runDeferredTurn(cwd, turn);
     return true;
+  }
+
+  private runDeferredTurn(cwd: string, turn: DeferredTurn) {
+    return this.runTurn(turn.prompt, turn.agent, turn.attachments, cwd, true, turn.questionOrigin,
+      turn.chatId, false, turn.messageKind, turn.binding);
   }
 
   // ---------- Мобильный доступ (удалённый клиент) ----------
@@ -6239,7 +6271,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                   const handler = this.runs.get(runKey) === controller &&
                     !controller.signal.aborted && this.steers.get(runKey) === steer ? steer.handler : undefined;
                   if (!handler) {
-                    if (this.deferTurn(cwd, agent, text, origin, chatId)) {
+                    if (this.deferTurn(cwd, { agent, prompt: text, questionOrigin: origin, chatId })) {
                       emit({ type: "info", text: "Живой канал исходного хода недоступен. Ответ отправится отдельным ходом в этой же сессии." });
                     }
                     return;
@@ -6252,7 +6284,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Только явный отказ до отправки допускает повторный ход.
                     // Неизвестная ошибка связи могла произойти уже после приёма.
                     if (/^ход уже заверш[её]н$/i.test(message) && !controller.signal.aborted) {
-                      if (this.deferTurn(cwd, agent, text, origin, chatId)) {
+                      if (this.deferTurn(cwd, { agent, prompt: text, questionOrigin: origin, chatId })) {
                         emit({ type: "info", text: "Исходный ход уже завершён. Ответ отправится отдельным ходом в этой же сессии." });
                       }
                     } else {
@@ -6412,7 +6444,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (nextDeferred) {
       // The queued answer resumes this CLI session, so release this turn's writer first.
       releaseWriter();
-      await this.runTurn(nextDeferred.prompt, nextDeferred.agent, [], cwd, true, nextDeferred.questionOrigin, nextDeferred.chatId, false, nextDeferred.messageKind, nextDeferred.binding);
+      await this.runDeferredTurn(cwd, nextDeferred);
     }
     if (turnSucceeded && !controller.signal.aborted) return true;
     } catch {
